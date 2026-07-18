@@ -1,0 +1,44 @@
+CREATE DATABASE IF NOT EXISTS chat CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE chat;
+
+CREATE TABLE IF NOT EXISTS user (
+    id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+    name VARCHAR(50) NOT NULL,
+    password VARCHAR(100) NOT NULL,
+    state ENUM('online', 'offline') NOT NULL DEFAULT 'offline',
+    PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS friend (
+    userid INT UNSIGNED NOT NULL,
+    friendid INT UNSIGNED NOT NULL,
+    PRIMARY KEY (userid, friendid),
+    CONSTRAINT fk_friend_user FOREIGN KEY (userid) REFERENCES user(id) ON DELETE CASCADE,
+    CONSTRAINT fk_friend_target FOREIGN KEY (friendid) REFERENCES user(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS allgroup (
+    id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+    groupname VARCHAR(50) NOT NULL,
+    groupdesc VARCHAR(200) NOT NULL DEFAULT '',
+    PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS groupuser (
+    groupid INT UNSIGNED NOT NULL,
+    userid INT UNSIGNED NOT NULL,
+    grouprole ENUM('creator', 'normal') NOT NULL DEFAULT 'normal',
+    PRIMARY KEY (groupid, userid),
+    CONSTRAINT fk_groupuser_group FOREIGN KEY (groupid) REFERENCES allgroup(id) ON DELETE CASCADE,
+    CONSTRAINT fk_groupuser_user FOREIGN KEY (userid) REFERENCES user(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS offlinemessage (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    userid INT UNSIGNED NOT NULL,
+    message MEDIUMTEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    KEY idx_offline_user (userid, id),
+    CONSTRAINT fk_offline_user FOREIGN KEY (userid) REFERENCES user(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

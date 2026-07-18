@@ -1,0 +1,83 @@
+x-chatserver-env: &chatserver-env
+  CHAT_MYSQL_HOST: mysql
+  CHAT_MYSQL_USER: root
+  CHAT_MYSQL_PASSWORD: chat-root-password
+  CHAT_MYSQL_DATABASE: chat
+  CHAT_REDIS_HOST: redis
+  CHAT_RABBITMQ_HOST: rabbitmq
+  CHAT_RABBITMQ_USER: chat
+  CHAT_RABBITMQ_PASSWORD: chat-password
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: chat-root-password
+      MYSQL_DATABASE: chat
+    volumes:
+      - ./docker/mysql/init.sql:/docker-entrypoint-initdb.d/01-chat.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-pchat-root-password"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:4.1-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: chat
+      RABBITMQ_DEFAULT_PASS: chat-password
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  chatserver-1:
+    build: .
+    depends_on:
+      mysql: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    command: ["/app/build/bin/ChatServer", "0.0.0.0", "6000"]
+    environment:
+      <<: *chatserver-env
+      CHAT_SERVER_ID: server-1
+
+  chatserver-2:
+    build: .
+    environment:
+      <<: *chatserver-env
+      CHAT_SERVER_ID: server-2
+    depends_on:
+      mysql: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    command: ["/app/build/bin/ChatServer", "0.0.0.0", "6000"]
+
+  web:
+    build: ./web
+    environment:
+      CHAT_WEB_PORT: 8080
+      CHAT_BACKEND_HOST: chatserver-1
+      CHAT_BACKEND_PORT: 6000
+    depends_on: [chatserver-1]
+    ports: ["8080:8080"]
+
+  web-2:
+    build: ./web
+    environment:
+      CHAT_WEB_PORT: 8080
+      CHAT_BACKEND_HOST: chatserver-2
+      CHAT_BACKEND_PORT: 6000
+    depends_on: [chatserver-2]
+    ports: ["8081:8080"]

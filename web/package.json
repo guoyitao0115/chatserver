@@ -1,0 +1,20 @@
+{
+  "name": "chatserver-web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal WebSocket-to-TCP adapter and browser client for ChatServer",
+  "scripts": {
+    "dev": "node --watch gateway.mjs",
+    "start": "node gateway.mjs",
+    "test": "node --test test/*.test.mjs",
+    "test:e2e": "node test/full-stack.mjs",
+    "test:reliability": "node test/reliability.mjs",
+    "test:load": "node test/load.mjs",
+    "test:chaos:rabbitmq": "node test/chaos-rabbitmq.mjs",
+    "test:chaos:mysql": "node test/chaos-mysql.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

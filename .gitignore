@@ -1,0 +1,11 @@
+.DS_Store
+/build/
+/bin/
+*.o
+*.a
+*.so
+*.dylib
+*.log
+/web/node_modules/
+/web/.env
+/.env
