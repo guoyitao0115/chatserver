@@ -3,7 +3,14 @@
 #include <vector>
 #include <cstdio>
 
-// 创建群组
+/**
+ * @brief 写入群基本信息，并把数据库生成的群 ID 回填到 group。
+ * @return 只有 INSERT 成功时返回 true。
+ *
+ * 群名与描述是外部输入，因此先使用当前连接的 mysql_real_escape_string
+ * 处理引号、反斜杠等字符。转义缓冲区按“原长度两倍+1”分配，
+ * 满足 MySQL C API 的最大膨胀空间。
+ */
 bool GroupModel::createGroup(Group &group)
 {
     MySQL mysql;
@@ -32,7 +39,12 @@ bool GroupModel::createGroup(Group &group)
     return false;
 }
 
-// 加入群组
+/**
+ * @brief 把用户与群、群角色之间的关系写入 groupuser 表。
+ *
+ * userid/groupid 是整数，role 则先转义后拼接。创建者传 creator，
+ * 普通成员传 normal。当前返回 void，上层无法直接区分“已加入”与“写入失败”。
+ */
 void GroupModel::addGroup(int userid, int groupid, string role)
 {
     MySQL mysql;
@@ -52,7 +64,15 @@ void GroupModel::addGroup(int userid, int groupid, string role)
     }
 }
 
-// 查询用户所在群组信息
+/**
+ * @brief 查询用户参加的所有群，并为每个群装载成员与角色。
+ * @return Group 列表；每个 Group 内部包含 GroupUser 列表。
+ *
+ * 执行分两阶段：先联表获取群基本信息，再按 groupid 逐群查询成员。
+ * 每个 mysql_use_result 结果都在发起下一条 SQL 前释放，满足流式结果集的资源约束。
+ *
+ * @note 该实现是经典 N+1 查询；群数较多时可改为一次联表查询后在内存分组。
+ */
 vector<Group> GroupModel::queryGroups(int userid)
 {
     /*
@@ -114,7 +134,12 @@ vector<Group> GroupModel::queryGroups(int userid)
     return groupVec;
 }
 
-// 根据指定的groupid查询群组用户id列表，除userid自己，主要用户群聊业务给群组其它成员群发消息
+/**
+ * @brief 获取群聊的所有目标成员 ID，并排除发送者自己。
+ *
+ * ChatService::groupChat() 使用返回列表逐个调用统一投递逻辑，从而为
+ * 本节点、其他节点与离线用户选择不同路由。结果集在本函数内完整释放。
+ */
 vector<int> GroupModel::queryGroupUsers(int userid, int groupid)
 {
     char sql[1024] = {0};

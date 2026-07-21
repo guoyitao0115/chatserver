@@ -26,94 +26,113 @@ using namespace muduo::net;
 #include "json.hpp"
 using json = nlohmann::json;
 
-// Redis去重key前缀（跨实例共享）
+// Redis 去重键命名空间。它必须在所有服务实例中保持一致，才能实现跨节点去重；
+// message_id 由客户端生成并拼接在此前缀后，TTL 由业务方法设置。
 static const string REDIS_DEDUP_KEY_PREFIX = "chat:dedup:";
 
-// 表示处理消息的事件回调方法类型
+// 消息处理器由网络层同步调用。json 已完成语法和 msgid 基础校验，但具体字段可能仍
+// 来自不可信客户端；每个处理器必须验证类型、范围和连接认证绑定。
 using MsgHandler = std::function<void(const TcpConnectionPtr &conn, json &js, Timestamp)>;
 
-// 聊天服务器业务类
+/**
+ * 聊天系统业务编排单例。
+ *
+ * 它连接网络会话、MySQL 模型、Redis 路由/去重以及 RabbitMQ 跨节点总线，并统一决定
+ * 消息走本地连接、跨节点队列还是离线库。实例会被多个 Muduo I/O 线程和 RabbitMQ
+ * 消费线程共同访问；连接索引由 _connMutex 保护，各外部客户端的线程安全规则由
+ * Redis/RabbitMqBus/MySQL 包装层分别承担。
+ */
 class ChatService
 {
 public:
-    // 获取单例对象的接口函数
+    // 返回进程内唯一实例。C++11 保证函数局部 static 的首次初始化线程安全；不转移所有权。
     static ChatService *instance();
 
-    // 处理登录业务
+    // 登录：校验密码、原子抢占在线路由、绑定连接，并返回离线消息/好友/群组快照。
     void login(const TcpConnectionPtr &conn, json &js, Timestamp time);
-    // 处理注册业务
+    // 注册：校验名称和 bcrypt 支持的密码长度，哈希后写库并返回新用户 ID。
     void reg(const TcpConnectionPtr &conn, json &js, Timestamp time);
-    // 一对一聊天业务
+    // 一对一聊天：校验发送者身份和目标，去重后统一投递，并按结果返回 ACK。
     void oneChat(const TcpConnectionPtr &conn, json &js, Timestamp time);
-    // 添加好友业务
+    // 添加好友：仅允许当前已认证用户以自己的 ID 发起关系写入。
     void addFriend(const TcpConnectionPtr &conn, json &js, Timestamp time);
-    // 创建群组业务
+    // 创建群组：落库群信息后将创建者以 creator 角色加入成员表。
     void createGroup(const TcpConnectionPtr &conn, json &js, Timestamp time);
-    // 加入群组业务
+    // 加入群组：以 normal 角色写入群成员关系；输入 ID 仍需认证和范围校验。
     void addGroup(const TcpConnectionPtr &conn, json &js, Timestamp time);
-    // 群组聊天业务
+    // 群聊：查询除发送者外的成员并逐个投递；任一投递失败时返回 ACK_FAIL 并撤销去重标记。
     void groupChat(const TcpConnectionPtr &conn, json &js, Timestamp time);
-    // 应用层心跳
+    // 心跳：验证连接身份、刷新当前节点持有的 Redis 路由租约并回送时间戳。
     void heartbeat(const TcpConnectionPtr &conn, json &js, Timestamp time);
+    // 正常注销：移除双向连接索引，仅在仍持有路由时把数据库状态更新为 offline。
     void loginout(const TcpConnectionPtr &conn, json &js, Timestamp time);
-    // 处理客户端异常退出
+    // 异常断线清理，按连接反查用户；旧连接不得覆盖用户在其他节点建立的新会话。
     void clientCloseException(const TcpConnectionPtr &conn);
-    // 服务器异常，业务重置方法
+    // 服务启动时将数据库遗留的 online 状态复位；会影响全表，应只在明确的恢复流程调用。
     void reset();
-    // 获取消息对应的处理器
+    // 按 msgid 返回处理器副本；未知类型返回记录错误的安全占位处理器，而非空函数。
     MsgHandler getHandler(int msgid);
-    // 从RabbitMQ总线中接收跨节点消息（direct 精确路由）
+    // RabbitMQ 消费线程入口：优先发给本节点连接，竞态下已下线则写入离线库兜底。
     void handleRabbitMqBusMessage(int userid, string msg);
 
 private:
+    // 私有构造器完成处理器注册和 Redis/RabbitMQ 初始化，防止产生多个状态中心。
     ChatService();
 
     /*
-     * 向客户端发送服务端接收确认（MSG_ACK）
+     * 向客户端发送服务端处理确认（MSG_ACK）。
      * 参数：
      *   conn      —— 目标连接
      *   msgId     —— 原消息的 message_id
-     *   ackState  —— ACK状态码（参见 public.hpp AckState 枚举）
+     *   ackState  —— ACK 状态码（参见 public.hpp AckState 枚举）
+     * 空连接、已关闭连接或空 message_id 时静默跳过，以兼容旧协议。ACK_OK 表示服务端
+     * 已完成本地/队列/离线库中的一种投递，不等价于接收用户已经阅读。
      */
     void sendAck(const TcpConnectionPtr &conn, const string &msgId, int ackState);
 
     /*
      * 统一消息投递函数
      * 优先本节点直接推送，否则通过RabbitMQ按 serverId 精确路由跨节点转发；
-     * 转发失败时同步写入离线库兜底，确保消息不丢。
+     * 转发失败时同步写入离线库兜底；只有直接发送、队列发布或离线落库成功才返回 true。
      * 参数：
      *   toUserId  —— 目标用户ID
      *   msg       —— 消息JSON字符串
-     *   route     —— 输出参数，记录实际路由路径（"local"/"rabbitmq"/"offline"）
+     *   route     —— 输出参数，记录实际路由路径，供日志和测试观察，不参与投递决策
+     * 复制本地 TcpConnectionPtr 后立即释放 _connMutex，再执行网络发送，避免慢客户端
+     * 把登录/退出等连接表操作阻塞在锁内。
      */
     bool deliverMsg(int toUserId, const string &msg, string &route);
 
     /*
-     * 去重策略：优先Redis（跨实例/跨重启窗口），失败时回退本地LRU去重。
+     * 去重策略：优先 Redis（跨实例共享），失败时回退本地 LRU 去重。
      * 返回 true=重复消息，false=新消息。
+     * false 会同时创建处理标记；若后续投递失败，调用方必须 forgetMessageMark()。
      */
     bool isDuplicateWithFallback(const string &msgId);
+    // 同时撤销 Redis 与本地标记；两边删除均设计为幂等，供失败重试路径调用。
     void forgetMessageMark(const string &msgId);
 
-    // 连接认证绑定：业务中的 id 只能等于该连接登录成功时绑定的用户。
+    // 在 _connMutex 下按连接名查询已认证用户；未登录、空连接返回 -1。
     int authenticatedUserId(const TcpConnectionPtr &conn);
+    // 验证 JSON 声明的用户 ID 与连接绑定一致；失败时记录 action 并发送 401。
     bool requireAuthenticatedUser(const TcpConnectionPtr &conn,
                                   int claimedUserId,
                                   const string &action);
+    // 发送统一 ERROR_MSG；连接无效或已关闭时不进行 I/O。
     void sendError(const TcpConnectionPtr &conn,
                    int code,
                    const string &message);
 
-    // 存储消息id和其对应的业务处理方法
+    // msgid -> 业务处理器。只在构造期写入，此后并发读取，无需额外加锁。
     unordered_map<int, MsgHandler> _msgHandlerMap;
 
-    // 存储在线用户的通信连接
+    // userId -> 本节点在线连接；shared_ptr 保证取出后连接对象在发送期间仍存活。
     unordered_map<int, TcpConnectionPtr> _userConnMap;
 
     // conn->name() -> userId，避免每条消息 O(n) 反查并阻止身份冒用。
     unordered_map<string, int> _connUserMap;
 
-    // 定义互斥锁，保证 _userConnMap 的线程安全
+    // 同时保护正向、反向连接索引，保证登录、注销和异常断线更新具备一致视图。
     mutex _connMutex;
 
     // 数据操作类对象
@@ -122,13 +141,13 @@ private:
     FriendModel     _friendModel;
     GroupModel      _groupModel;
 
-    // redis操作对象（仅用于去重键）
+    // Redis 同时保存共享去重键和 userId -> serverId 的带 TTL 在线路由。
     Redis _redis;
 
     // RabbitMQ跨节点消息总线（direct 精确路由）
     RabbitMqBus _rabbitMqBus;
 
-    // 当前服务实例ID（用于RabbitMQ routing_key与Redis在线路由）
+    // 当前实例唯一 ID，用作 RabbitMQ routing_key 和 Redis 路由值；可由环境变量覆盖。
     string _serverId = "server-1";
 
     // 消息去重器：LRU+TTL，容量10000条，TTL120秒

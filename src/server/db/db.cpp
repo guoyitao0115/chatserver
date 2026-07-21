@@ -2,20 +2,36 @@
 #include "config.hpp"
 #include <muduo/base/Logging.h>
 
-// 初始化数据库连接
+/**
+ * @brief 创建一个 MySQL C API 连接句柄。
+ *
+ * mysql_init 只初始化本地句柄，真正的 TCP 连接由 connect() 建立。
+ * 每个 Model 方法都在栈上创建 MySQL 对象，因此句柄不在多线程之间共享。
+ */
 MySQL::MySQL()
 {
     _conn = mysql_init(nullptr);
 }
 
-// 释放数据库连接资源
+/**
+ * @brief 释放连接句柄，保证所有早退路径都不泄漏数据库资源。
+ *
+ * Model 层依赖 RAII：无论 SQL 成功还是失败，函数返回时析构函数都会
+ * 执行 mysql_close。
+ */
 MySQL::~MySQL()
 {
     if (_conn != nullptr)
         mysql_close(_conn);
 }
 
-// 连接数据库
+/**
+ * @brief 根据环境变量建立数据库连接。
+ * @return 连接成功返回 true，否则记录目标主机和 MySQL 错误并返回 false。
+ *
+ * 配置优先从 CHAT_MYSQL_* 环境变量读取，未设置时使用本地开发默认值。
+ * 连接成功后设置 utf8mb4，以完整保存中文和 emoji，避免聊天内容乱码。
+ */
 bool MySQL::connect()
 {
     const string server = chatserver::config::envOr("CHAT_MYSQL_HOST", "127.0.0.1");
@@ -40,7 +56,13 @@ bool MySQL::connect()
     return p;
 }
 
-// 更新操作
+/**
+ * @brief 执行不需要返回结果集的 SQL，如 INSERT/UPDATE/DELETE。
+ * @param sql 已由上层按字段类型组装并对字符串进行转义的 SQL。
+ * @return mysql_query 执行成功返回 true。
+ *
+ * 错误日志故意不输出完整 SQL，因为 SQL 可能包含密码哈希或聊天正文。
+ */
 bool MySQL::update(string sql)
 {
     if (mysql_query(_conn, sql.c_str()))
@@ -53,7 +75,13 @@ bool MySQL::update(string sql)
     return true;
 }
 
-// 查询操作
+/**
+ * @brief 执行 SELECT 并返回流式结果集。
+ * @return 成功时返回 mysql_use_result 的 MYSQL_RES*，失败返回 nullptr。
+ *
+ * mysql_use_result 不会一次性把整个结果集搬入内存，但调用方必须完整读取并
+ * mysql_free_result，且在释放前不能在同一连接上发送新查询。
+ */
 MYSQL_RES *MySQL::query(string sql)
 {
     if (mysql_query(_conn, sql.c_str()))
@@ -65,7 +93,11 @@ MYSQL_RES *MySQL::query(string sql)
     return mysql_use_result(_conn);
 }
 
-// 获取连接
+/**
+ * @brief 暴露当前 MYSQL 句柄，供字符串转义和获取自增主键使用。
+ *
+ * 返回值的生命周期不超过当前 MySQL 对象，调用方不应缓存该指针。
+ */
 MYSQL* MySQL::getConnection()
 {
     return _conn;

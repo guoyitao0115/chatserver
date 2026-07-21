@@ -1,11 +1,17 @@
+# macOS Finder 元数据。
 .DS_Store
+# CMake 本地构建与历史学习样例输出。
 /build/
 /bin/
+# 常见 C/C++ 编译、静态/动态链接产物。
 *.o
 *.a
 *.so
 *.dylib
+# 本地运行日志可能包含地址、账号或调试信息。
 *.log
+# Web 依赖可由 package-lock/package.json 恢复，不提交安装目录。
 /web/node_modules/
+# 本地密钥和运行参数禁止入库；只提交根目录 .env.example。
 /web/.env
 /.env

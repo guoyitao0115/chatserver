@@ -1,3 +1,4 @@
+# 两个 ChatServer 节点共享的连接参数。YAML anchor 只减少重复，不会创建服务。
 x-chatserver-env: &chatserver-env
   CHAT_MYSQL_HOST: mysql
   CHAT_MYSQL_USER: root
@@ -9,6 +10,7 @@ x-chatserver-env: &chatserver-env
   CHAT_RABBITMQ_PASSWORD: chat-password
 
 services:
+  # MySQL 保存用户、好友、群组以及离线消息；初始化脚本仅在新数据目录首次创建时执行。
   mysql:
     image: mysql:8.4
     environment:
@@ -16,12 +18,14 @@ services:
       MYSQL_DATABASE: chat
     volumes:
       - ./docker/mysql/init.sql:/docker-entrypoint-initdb.d/01-chat.sql:ro
+    # ChatServer 等到数据库真正可响应，而不是只等容器进程启动。
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-pchat-root-password"]
       interval: 3s
       timeout: 3s
       retries: 30
 
+  # Redis 保存带 TTL 的用户节点路由和跨节点消息去重键；AOF 提高重启后的可恢复性。
   redis:
     image: redis:7.4-alpine
     command: ["redis-server", "--appendonly", "yes"]
@@ -31,6 +35,7 @@ services:
       timeout: 3s
       retries: 20
 
+  # RabbitMQ 使用 direct exchange 在服务节点间转发在线消息。
   rabbitmq:
     image: rabbitmq:4.1-alpine
     environment:
@@ -42,6 +47,7 @@ services:
       timeout: 5s
       retries: 30
 
+  # 节点 1 与节点 2 使用同一镜像和依赖，但 CHAT_SERVER_ID 必须唯一。
   chatserver-1:
     build: .
     depends_on:
@@ -64,6 +70,7 @@ services:
       rabbitmq: { condition: service_healthy }
     command: ["/app/build/bin/ChatServer", "0.0.0.0", "6000"]
 
+  # 每个 Web 网关只桥接一个 C++ 节点：浏览器 WebSocket <-> 后端长度帧 TCP。
   web:
     build: ./web
     environment:
@@ -71,6 +78,7 @@ services:
       CHAT_BACKEND_HOST: chatserver-1
       CHAT_BACKEND_PORT: 6000
     depends_on: [chatserver-1]
+    # 本机 8080 对应 server-1，供浏览器和同/跨节点测试使用。
     ports: ["8080:8080"]
 
   web-2:
@@ -80,4 +88,5 @@ services:
       CHAT_BACKEND_HOST: chatserver-2
       CHAT_BACKEND_PORT: 6000
     depends_on: [chatserver-2]
+    # 第二个入口用于验证 Redis 路由和 RabbitMQ 跨节点投递。
     ports: ["8081:8080"]

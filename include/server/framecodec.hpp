@@ -43,16 +43,24 @@ using chatserver::protocol::FRAME_MAX_PAYLOAD;
 class FrameCodec
 {
 public:
-    // 消息回调类型：每解出一条完整消息就调用一次
+    /**
+     * 完整帧回调：每成功解出一个 payload 调用一次。
+     * conn 和 Timestamp 原样传给业务层；payload 是独立字符串，不再依赖 Buffer。
+     * 回调在调用 decode() 的 Muduo I/O 线程内同步执行，处理器应避免长时间阻塞。
+     */
     using MessageCallback = std::function<void(const TcpConnectionPtr &,
                                                const string &payload,
                                                Timestamp)>;
 
+    // codec 持有回调副本，其生命周期必须覆盖所有 decode() 调用。
+    // 传入空 std::function 会在完整帧到达时抛出 bad_function_call，构造方应保证有效。
     explicit FrameCodec(MessageCallback cb) : _messageCb(std::move(cb)) {}
 
     /*
-     * 编码：将payload打包成 [4字节长度][payload] 帧
-     * 返回值：完整帧字节串，调用方直接 conn->send() 即可
+     * 编码：将 payload 打包成 [4字节长度][payload] 帧。
+     * 返回完整帧字节串，调用方可直接 conn->send()。空 payload 或超过 4 MiB 时
+     * 底层 encodeFrame() 抛出 length_error，调用方应把它作为本地协议错误处理。
+     * 此静态函数没有共享状态，可由多个线程并发调用。
      */
     static string encode(const string &payload)
     {
@@ -60,9 +68,15 @@ public:
     }
 
     /*
-     * 解码：从muduo Buffer中尽量多地提取完整帧
-     * 每提取到一个完整帧就回调 _messageCb
-     * 不完整的数据留在buffer中，等待下次onMessage追加后再解
+     * 解码：从 Muduo Buffer 中尽量多地提取完整帧。
+     *
+     * - 一个 Buffer 中有多帧时按字节流顺序逐帧回调，解决粘包；
+     * - 只有半个帧头或半个 body 时不消费数据，留待下一次 onMessage，解决拆包；
+     * - 长度为 0 或超过上限时关闭连接，避免死循环、超大内存占用和慢速攻击。
+     *
+     * buf 必须非空且属于 conn 当前回调上下文。该对象本身不加锁，预期每条连接的
+     * Buffer 只由所属 EventLoop 线程访问；不要让多个线程同时对同一 Buffer decode。
+     * 关闭连接是异步行为，发现协议错误后必须立即退出本轮解析。
      */
     void decode(const TcpConnectionPtr &conn, Buffer *buf, Timestamp ts)
     {
@@ -106,7 +120,8 @@ public:
     }
 
 private:
-    MessageCallback _messageCb; // 完整帧到达后的回调
+    // 完整帧到达后的业务入口；FrameCodec 只负责边界解析，不理解 JSON 字段。
+    MessageCallback _messageCb;
 };
 
 #endif // FRAMECODEC_HPP

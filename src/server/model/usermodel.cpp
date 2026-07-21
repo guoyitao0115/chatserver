@@ -6,7 +6,14 @@
 #include <cstdio>
 using namespace std;
 
-// User表的增加方法
+/**
+ * @brief 创建用户，并回填数据库生成的用户 ID。
+ * @param user 包含用户名、bcrypt 密码哈希和初始状态的领域对象。
+ * @return INSERT 成功时返回 true，否则返回 false。
+ *
+ * 所有字符串字段均在已建立的 MySQL 连接上转义，既防止引号破坏
+ * SQL 结构，也保证 bcrypt 中的特殊字符按原值保存。
+ */
 bool UserModel::insert(User &user)
 {
     MySQL mysql;
@@ -42,7 +49,13 @@ bool UserModel::insert(User &user)
     return false;
 }
 
-// 根据用户号码查询用户信息
+/**
+ * @brief 按主键查询用户的认证与在线状态。
+ * @return 命中时返回填充完整字段的 User；不存在或数据库失败时返回默认 User。
+ *
+ * 返回前先释放 MYSQL_RES，避免早退分支泄漏结果集。调用方通常以
+ * user.getId() 是否等于查询 ID 来判断是否命中。
+ */
 User UserModel::query(int id)
 {
     // 1.组装sql语句
@@ -73,7 +86,12 @@ User UserModel::query(int id)
     return User();
 }
 
-// 更新用户密码哈希
+/**
+ * @brief 更新用户密码字段，用于历史明文密码的平滑 bcrypt 迁移。
+ *
+ * 登录时若旧密码校验成功，ChatService 生成新哈希后调用本函数。
+ * 哈希仍先转义再写入，函数返回值用于反映数据库是否成功接受升级。
+ */
 bool UserModel::updatePassword(int id, const string &pwdHash)
 {
     MySQL mysql;
@@ -95,7 +113,12 @@ bool UserModel::updatePassword(int id, const string &pwdHash)
     return mysql.update(sql);
 }
 
-// 更新用户的状态信息
+/**
+ * @brief 把 User 中的 online/offline 状态写回数据库。
+ *
+ * 状态字符串经转义后与整数 ID 拼接。调用者在登录失败时会根据返回值
+ * 回滚 Redis 路由声明，避免路由已占用而数据库仍是离线的不一致。
+ */
 bool UserModel::updateState(User user)
 {
     MySQL mysql;
@@ -117,7 +140,12 @@ bool UserModel::updateState(User user)
     return mysql.update(sql);
 }
 
-// 重置用户的状态信息
+/**
+ * @brief 把数据库中所有 online 记录重置为 offline。
+ *
+ * 用于单节点服务启动/停止后清理残留状态。多节点场景下这是粗粒度
+ * 操作，不能代替 Redis 中带服务器归属和 TTL 的实时路由。
+ */
 void UserModel::resetState()
 {
     // 1.组装sql语句
