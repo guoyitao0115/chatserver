@@ -2,36 +2,41 @@
 
 ## 作用概览
 
-`GroupUser` 继承 `User`，在用户基本信息上增加群角色，专门表示“某用户在某群中的成员视图”。
+**群成员领域对象。** 在普通用户字段之外增加群角色，使查询群详情时能同时返回成员身份，例如创建者与普通成员。
 
-## 按学习顺序讲解
+阅读位置：`include/server/model/groupuser.hpp`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-- 继承的 `User` 函数负责 ID、昵称、密码和状态。
-- `setRole(role)`：设置 `creator` 或 `normal`。
-- `getRole()`：读取该用户在当前群内的角色。
+## 代码片段与详细讲解
 
-## 函数详细说明
+### 片段 1：第 1-20 行
 
-### 继承自 `User` 的函数
+```cpp
+#ifndef GROUPUSER_H
+#define GROUPUSER_H
 
-`GroupUser` 继承 `User`，因此天然拥有 `setId/getId`、`setName/getName`、`setPwd/getPwd`、`setState/getState` 这些用户字段操作。模型层查询群成员时，会复用这些函数设置成员 ID、昵称、在线状态等信息。
+#include "user.hpp"
 
-在这个项目里，`GroupUser` 不表示“一个全新的用户类型”，而是表示“用户在某个群里的视图”。所以它既需要用户基础信息，也需要群内角色。
+// 群成员对象在 User 基础上增加 role 字段。
+// 继承 User 可以直接复用 id/name/state 等展示信息，role 则来自 groupuser.grouprole。
+class GroupUser : public User
+{
+public:
+    // role 常见值为 "creator" 或 "normal"，业务层可据此区分群主和普通成员。
+    void setRole(string role) { this->role = role; }
+    string getRole() { return this->role; }
 
-### `setRole(role)`
+private:
+    // 只描述用户在某个群中的角色，不代表用户全局权限。
+    string role;
+};
 
-这个函数设置用户在当前群里的角色。参数 `role` 通常来自 `GroupUser` 表，例如 `creator` 表示群主，`normal` 表示普通成员。
+#endif
+```
 
-调用方一般是 `GroupModel::queryGroups`：数据库查到每个成员的角色后，创建 `GroupUser` 对象并写入角色。这样登录响应能告诉客户端某个成员是不是群主。
-
-边界点是当前角色是字符串，灵活但容易写错。更严谨的设计可以用枚举或常量集中管理角色值，并在数据库层增加约束。
-
-### `getRole()`
-
-这个函数读取群角色，通常用于组装登录响应或后续权限判断。当前项目主要把角色展示给客户端，还没有实现踢人、改群名、转让群主等权限控制。
-
-如果面试官追问扩展方向，可以说明：有了 `role` 字段后，可以在服务端为群管理类操作加权限判断，而不是让客户端自己决定谁能操作。
+`Group` 是在数据库模型与业务层之间传递的值对象。setter 在查询后逐字段组装对象，getter 在登录响应序列化时读取；对象本身不执行 SQL，也不判断登录或群权限，从而保持职责单一。
 
 ## 面试重点
 
-重要性较低。可能问题：继承是否必要？这里用于复用字段，组合一个 `User` 成员也可以减少“GroupUser 是 User”语义上的耦合。
+- 这个文件处于哪一层，它保存的数据由谁创建、由谁消费？
+
+- 如果删除或修改本文件，最先受影响的运行链路是什么？

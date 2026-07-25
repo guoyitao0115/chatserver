@@ -2,145 +2,215 @@
 
 ## 作用概览
 
-该文件定义核心业务单例 `ChatService`：用户认证、好友/群组、可靠消息、在线连接、Redis 路由与去重、RabbitMQ 跨节点转发以及 MySQL 离线兜底都在此协调。各 Model 负责具体 SQL，本类负责业务编排。
+**业务层契约与共享状态。** 集中声明登录、关系、聊天、心跳等处理器，以及本地连接表、数据模型、Redis 路由、RabbitMQ 总线和去重缓存。两个方向的连接索引用于既能按用户投递，也能在断线时反查用户。
 
-## 按学习顺序讲解
+阅读位置：`include/server/chatservice.hpp`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-### 生命周期与分发
+## 代码片段与详细讲解
 
-- `instance()`：返回进程内唯一实例。
-- `ChatService()`：注册 `msgid -> handler`，连接 Redis/RabbitMQ 并设置消费回调。
-- `getHandler(msgid)`：返回对应处理器；未知类型返回记录错误的兜底函数。
-- `reset()`：服务退出时把数据库中的在线状态重置为离线。
+### 片段 1：第 1-27 行
 
-### 认证与错误
+```cpp
+#ifndef CHATSERVICE_H
+#define CHATSERVICE_H
 
-- `authenticatedUserId(conn)`：通过连接名 O(1) 查询已绑定用户。
-- `requireAuthenticatedUser(conn, claimedUserId, action)`：拒绝未登录连接或消息体冒用其他用户 ID。
-- `sendError(conn, code, message)`：发送统一 `ERROR_MSG` 帧。
-- `login/reg/loginout/clientCloseException`：分别完成登录、注册、主动注销和异常断线清理。登录还负责原子抢占 Redis 路由、拉取离线消息及好友/群资料。
-- `heartbeat`：校验身份、续期 Redis 在线路由并返回心跳 ACK。
+/*
+ * ChatService 业务层：
+ * - 用户/好友/群组/离线消息管理
+ * - RabbitMQ 跨节点转发
+ * - 消息 ACK 与去重（去重仍用Redis键）
+ */
 
-### 可靠投递
+#include <muduo/net/TcpConnection.h>
+#include <unordered_map>
+#include <functional>
+#include <mutex>
+using namespace std;
+using namespace muduo;
+using namespace muduo::net;
 
-- `isDuplicateWithFallback(msgId)`：优先用 Redis `SET NX EX` 做跨节点去重，Redis 故障时退回进程内 LRU。
-- `forgetMessageMark(msgId)`：投递及离线落库都失败时撤销去重标记，允许同 ID 重试。
-- `sendAck(conn, msgId, state)`：返回处理结果，空 ID 兼容旧客户端。
-- `deliverMsg(toUserId, msg, route)`：按“本节点连接 → Redis 路由 + RabbitMQ → MySQL 离线消息”选择路径。
+#include "redis.hpp"
+#include "rabbitmq_bus.hpp"
+#include "groupmodel.hpp"
+#include "friendmodel.hpp"
+#include "usermodel.hpp"
+#include "offlinemessagemodel.hpp"
+#include "msgdedup.hpp"   // 消息去重模块
+#include "json.hpp"
+using json = nlohmann::json;
+```
 
-### 业务处理器
+这些头文件把“业务层契约与共享状态”接到项目公共协议、领域对象和所需系统库。依赖方向保持从实现到接口：模型不知道网络连接，帧工具不知道用户业务，当前文件负责在自己的层内组合它们。
 
-- `oneChat`：认证、校验 ID、去重、统一投递并 ACK。
-- `addFriend`：认证后保存好友关系。
-- `createGroup`：创建群并把创建者加入群。
-- `addGroup`：把当前用户加入指定群。
-- `groupChat`：认证和去重后查询其他成员，逐一调用统一投递；整体失败时撤销标记并返回失败 ACK。
-- `handleRabbitMqBusMessage`：消费目标节点消息，本地连接存在则发送，否则写离线库。
+### 片段 2：第 28-49 行
 
-## 函数详细说明
+```cpp
 
-### 单例、初始化与分发
+// Redis 去重键命名空间。它必须在所有服务实例中保持一致，才能实现跨节点去重；
+// message_id 由客户端生成并拼接在此前缀后，TTL 由业务方法设置。
+static const string REDIS_DEDUP_KEY_PREFIX = "chat:dedup:";
 
-#### `static ChatService *instance()`
+// 消息处理器由网络层同步调用。json 已完成语法和 msgid 基础校验，但具体字段可能仍
+// 来自不可信客户端；每个处理器必须验证类型、范围和连接认证绑定。
+using MsgHandler = std::function<void(const TcpConnectionPtr &conn, json &js, Timestamp)>;
 
-返回函数内静态实例地址。C++11 起静态局部变量初始化具备线程安全保证；返回裸指针不表示调用方拥有对象，不能 delete。
+/**
+ * 聊天系统业务编排单例。
+ *
+ * 它连接网络会话、MySQL 模型、Redis 路由/去重以及 RabbitMQ 跨节点总线，并统一决定
+ * 消息走本地连接、跨节点队列还是离线库。实例会被多个 Muduo I/O 线程和 RabbitMQ
+ * 消费线程共同访问；连接索引由 _connMutex 保护，各外部客户端的线程安全规则由
+ * Redis/RabbitMqBus/MySQL 包装层分别承担。
+ */
+class ChatService
+{
+public:
+    // 返回进程内唯一实例。C++11 保证函数局部 static 的首次初始化线程安全；不转移所有权。
+    static ChatService *instance();
+```
 
-#### `ChatService()`
+这里固定模块需要长期保存的状态。这些成员把跨回调信息留在对象生命周期内；实现文件中的锁和清理逻辑必须围绕它们保持一致。
 
-私有构造保证外部只能走单例。它建立消息编号到成员函数的绑定，初始化本地去重器，连接 Redis，注册 RabbitMQ 消费回调并连接 broker。初始化失败不会阻止进程启动：Redis 有本地降级，RabbitMQ 失败后跨节点投递会落离线库。
+### 片段 3：第 50-76 行
 
-#### `MsgHandler getHandler(int msgid)`
+```cpp
 
-在 `_msgHandlerMap` 中查找并按值返回 `std::function`。未知编号不抛异常，而是返回一个记录错误日志的 lambda，使网络线程不会因 `map::at` 失败退出。
+    // 登录：校验密码、原子抢占在线路由、绑定连接，并返回离线消息/好友/群组快照。
+    void login(const TcpConnectionPtr &conn, json &js, Timestamp time);
+    // 注册：校验名称和 bcrypt 支持的密码长度，哈希后写库并返回新用户 ID。
+    void reg(const TcpConnectionPtr &conn, json &js, Timestamp time);
+    // 一对一聊天：校验发送者身份和目标，去重后统一投递，并按结果返回 ACK。
+    void oneChat(const TcpConnectionPtr &conn, json &js, Timestamp time);
+    // 添加好友：仅允许当前已认证用户以自己的 ID 发起关系写入。
+    void addFriend(const TcpConnectionPtr &conn, json &js, Timestamp time);
+    // 创建群组：落库群信息后将创建者以 creator 角色加入成员表。
+    void createGroup(const TcpConnectionPtr &conn, json &js, Timestamp time);
+    // 加入群组：以 normal 角色写入群成员关系；输入 ID 仍需认证和范围校验。
+    void addGroup(const TcpConnectionPtr &conn, json &js, Timestamp time);
+    // 群聊：查询除发送者外的成员并逐个投递；任一投递失败时返回 ACK_FAIL 并撤销去重标记。
+    void groupChat(const TcpConnectionPtr &conn, json &js, Timestamp time);
+    // 心跳：验证连接身份、刷新当前节点持有的 Redis 路由租约并回送时间戳。
+    void heartbeat(const TcpConnectionPtr &conn, json &js, Timestamp time);
+    // 正常注销：移除双向连接索引，仅在仍持有路由时把数据库状态更新为 offline。
+    void loginout(const TcpConnectionPtr &conn, json &js, Timestamp time);
+    // 异常断线清理，按连接反查用户；旧连接不得覆盖用户在其他节点建立的新会话。
+    void clientCloseException(const TcpConnectionPtr &conn);
+    // 服务启动时将数据库遗留的 online 状态复位；会影响全表，应只在明确的恢复流程调用。
+    void reset();
+    // 按 msgid 返回处理器副本；未知类型返回记录错误的安全占位处理器，而非空函数。
+    MsgHandler getHandler(int msgid);
+    // RabbitMQ 消费线程入口：优先发给本节点连接，竞态下已下线则写入离线库兜底。
+    void handleRabbitMqBusMessage(int userid, string msg);
+```
 
-#### `void reset()`
+登录后才周期发送心跳。发送下一轮前若上一轮仍未确认，只提示连接可能不稳定而不立即断开，减少短暂调度延迟造成误判；收到 HEARTBEAT_ACK 后接收线程会重新设置确认标志。
 
-委托 `UserModel::resetState` 批量清理在线状态。它只处理数据库视图，不清理本进程 map；通常用于进程即将退出的路径。
+### 片段 4：第 77-104 行
 
-### 连接身份与错误响应
+```cpp
 
-#### `authenticatedUserId(conn)`
+private:
+    // 私有构造器完成处理器注册和 Redis/RabbitMQ 初始化，防止产生多个状态中心。
+    ChatService();
 
-校验连接指针后，在 `_connMutex` 保护下用连接名查询 `_connUserMap`。找到返回正用户 ID，未绑定返回 -1；反向表让每条消息无需 O(n) 扫描 `_userConnMap`。
+    /*
+     * 向客户端发送服务端处理确认（MSG_ACK）。
+     * 参数：
+     *   conn      —— 目标连接
+     *   msgId     —— 原消息的 message_id
+     *   ackState  —— ACK 状态码（参见 public.hpp AckState 枚举）
+     * 空连接、已关闭连接或空 message_id 时静默跳过，以兼容旧协议。ACK_OK 表示服务端
+     * 已完成本地/队列/离线库中的一种投递，不等价于接收用户已经阅读。
+     */
+    void sendAck(const TcpConnectionPtr &conn, const string &msgId, int ackState);
 
-#### `requireAuthenticatedUser(conn, claimedUserId, action)`
+    /*
+     * 统一消息投递函数
+     * 优先本节点直接推送，否则通过RabbitMQ按 serverId 精确路由跨节点转发；
+     * 转发失败时同步写入离线库兜底；只有直接发送、队列发布或离线落库成功才返回 true。
+     * 参数：
+     *   toUserId  —— 目标用户ID
+     *   msg       —— 消息JSON字符串
+     *   route     —— 输出参数，记录实际路由路径，供日志和测试观察，不参与投递决策
+     * 复制本地 TcpConnectionPtr 后立即释放 _connMutex，再执行网络发送，避免慢客户端
+     * 把登录/退出等连接表操作阻塞在锁内。
+     */
+    bool deliverMsg(int toUserId, const string &msg, string &route);
+```
 
-把连接真实绑定 ID 与 JSON 声明 ID 比较。匹配且为正数才返回 true；否则记录 action、声明 ID、真实 ID，调用 `sendError(401,...)` 并返回 false。所有能代表用户修改状态或发消息的 handler 都应先调用它。
+这里根据投递结果决定回执：成功才返回 ACK_OK，重复请求返回 ACK_DEDUP，完全失败先撤销去重占位再 ACK_FAIL。撤销动作让客户端以同一 message_id 重试时还有机会重新投递。
 
-#### `sendError(conn, code, message)`
+### 片段 5：第 105-127 行
 
-连接为空或已断开时直接返回；否则生成 `ERROR_MSG` JSON，经 `FrameCodec` 发送。它统一错误格式，但不会关闭连接，客户端可以修正请求继续使用。
+```cpp
 
-### 去重、确认与投递
+    /*
+     * 去重策略：优先 Redis（跨实例共享），失败时回退本地 LRU 去重。
+     * 返回 true=重复消息，false=新消息。
+     * false 会同时创建处理标记；若后续投递失败，调用方必须 forgetMessageMark()。
+     */
+    bool isDuplicateWithFallback(const string &msgId);
+    // 同时撤销 Redis 与本地标记；两边删除均设计为幂等，供失败重试路径调用。
+    void forgetMessageMark(const string &msgId);
 
-#### `isDuplicateWithFallback(msgId)`
+    // 在 _connMutex 下按连接名查询已认证用户；未登录、空连接返回 -1。
+    int authenticatedUserId(const TcpConnectionPtr &conn);
+    // 验证 JSON 声明的用户 ID 与连接绑定一致；失败时记录 action 并发送 401。
+    bool requireAuthenticatedUser(const TcpConnectionPtr &conn,
+                                  int claimedUserId,
+                                  const string &action);
+    // 发送统一 ERROR_MSG；连接无效或已关闭时不进行 I/O。
+    void sendError(const TcpConnectionPtr &conn,
+                   int code,
+                   const string &message);
 
-空 ID 为兼容旧客户端直接视为新消息。非空 ID 先调用 Redis 原子写入：1 表示第一次，0 表示已存在；只有 -1 故障时才进入本地 LRU。返回 true 的调用方必须跳过所有副作用并回 `ACK_DEDUP`。
+    // msgid -> 业务处理器。只在构造期写入，此后并发读取，无需额外加锁。
+    unordered_map<int, MsgHandler> _msgHandlerMap;
+```
 
-#### `forgetMessageMark(msgId)`
+这里根据投递结果决定回执：成功才返回 ACK_OK，重复请求返回 ACK_DEDUP，完全失败先撤销去重占位再 ACK_FAIL。撤销动作让客户端以同一 message_id 重试时还有机会重新投递。 这段继续落实“业务层契约与共享状态”的当前分支，并把已确认结果交给紧接着的状态更新；失败路径不会伪装成成功响应。
 
-同时尝试删除 Redis key 和本地 LRU 条目。用于“所有投递与离线持久化均失败”的补偿，否则发送方重试相同 ID 时会被错误去重。
+### 片段 6：第 128-157 行
 
-#### `sendAck(conn,msgId,ackState)`
+```cpp
 
-只对有效连接和非空 ID发送。ACK 携带原 `message_id` 和处理状态，使并发 pending 消息能准确匹配；它确认服务端处理结果，不代表接收人已读。
+    // userId -> 本节点在线连接；shared_ptr 保证取出后连接对象在发送期间仍存活。
+    unordered_map<int, TcpConnectionPtr> _userConnMap;
 
-#### `deliverMsg(toUserId,msg,route)`
+    // conn->name() -> userId，避免每条消息 O(n) 反查并阻止身份冒用。
+    unordered_map<string, int> _connUserMap;
 
-1. 锁内查本节点连接并复制智能指针，锁外发送；成功 route=`local`。
-2. 本地不在线时查用户数据库状态；若为 online，再从 Redis 取节点 ID 并 RabbitMQ 精确发布，成功 route=`rabbitmq`。
-3. Redis 路由缺失、MQ 发布失败或用户离线时，写 `offlinemessage`，route 为 `offline` 或 `offline_fallback`。
-4. 返回值只在某条路径成功时为 true；业务 handler 据此决定 ACK_OK 或 ACK_FAIL。
+    // 同时保护正向、反向连接索引，保证登录、注销和异常断线更新具备一致视图。
+    mutex _connMutex;
 
-### 账户函数
+    // 数据操作类对象
+    UserModel       _userModel;
+    OfflineMsgModel _offlineMsgModel;
+    FriendModel     _friendModel;
+    GroupModel      _groupModel;
 
-#### `login(conn,js,time)`
+    // Redis 同时保存共享去重键和 userId -> serverId 的带 TTL 在线路由。
+    Redis _redis;
 
-读取 ID/密码并校验；禁止同一连接切换为另一个账号；查询用户并根据哈希前缀走 bcrypt 或旧明文校验。认证通过后用 Redis `SET NX` 抢占路由，更新数据库 online 和双向连接 map；任一步失败会回滚已抢占路由。成功响应还组装离线消息、好友和群组；旧明文密码在本次登录后升级为 bcrypt。
+    // RabbitMQ跨节点消息总线（direct 精确路由）
+    RabbitMqBus _rabbitMqBus;
 
-#### `reg(conn,js,time)`
+    // 当前实例唯一 ID，用作 RabbitMQ routing_key 和 Redis 路由值；可由环境变量覆盖。
+    string _serverId = "server-1";
 
-检查昵称非空且不超过 50、密码 6～72 字节；生成 cost 12 bcrypt 哈希，构造 `User` 并插入。成功返回自增 ID，哈希或数据库失败返回注册错误，不把明文落库。
+    // 消息去重器：LRU+TTL，容量10000条，TTL120秒
+    MsgDedup _dedup;
+};
 
-#### `loginout(conn,js,time)`
+#endif
+```
 
-先验证连接身份；锁内删除用户→连接和连接→用户两张映射；条件删除只属于本节点的 Redis 路由。只有路由未被其他会话接管时才把数据库改为 offline，避免旧连接覆盖新登录。
-
-#### `clientCloseException(conn)`
-
-不信任客户端 JSON，而是从反向连接表找用户；清理本地 map、RabbitMQ 兼容订阅与 Redis 路由。和主动注销一样使用“仅持有者删除”，处理网络断开与跨节点重登竞态。
-
-### 业务函数
-
-#### `oneChat(conn,js,time)`
-
-提取发送者、接收者、消息 ID；认证后做跨节点去重。重复时立即 ACK_DEDUP；新消息序列化原 JSON 并调用 `deliverMsg`。成功 ACK_OK，失败先撤销去重标记再 ACK_FAIL，使同 ID 可重试。
-
-#### `addFriend(conn,js,time)`
-
-验证当前用户后，把 `userid/friendid` 交给 `FriendModel::insert`。当前 Model 无返回值，因此请求没有明确成功响应，这也是可改进点。
-
-#### `createGroup(conn,js,time)`
-
-认证发送者，读取群名/描述，创建 `Group`。数据库生成 ID 后再以 `creator` 角色加入 `groupuser`；两步目前不是事务，第二步失败可能留下无创建者群。
-
-#### `addGroup(conn,js,time)`
-
-认证后把用户以 `normal` 角色加入群。联合主键会阻止重复入群，但当前 handler 未把数据库错误细分给客户端。
-
-#### `groupChat(conn,js,time)`
-
-认证与去重后查询群内其他用户 ID，对每人调用 `deliverMsg`。全部成功才 ACK_OK；存在失败则撤销整个 message ID 并 ACK_FAIL。重试可能让此前成功成员再次经过投递，因此依赖接收端 message ID 去重；更严格实现应记录成员级投递状态。
-
-#### `heartbeat(conn,js,time)`
-
-验证用户身份后，只在 Redis 路由仍等于当前 `serverId` 时续 TTL。续期成功返回心跳 ACK；不匹配说明当前连接已失去会话所有权，应拒绝而不是延长旧路由。
-
-#### `handleRabbitMqBusMessage(userid,msg)`
-
-消费线程收到目标用户消息后，锁内查本地连接、锁外发送；若连接刚断开或不存在则写离线库。它补上“消息已到目标节点但用户状态发生切换”的最后竞态窗口。
-
+互斥区保护 `_userConnMap`、`_connUserMap`、`_connMutex` 的一致性。这里需要关注的不只是单个容器不崩溃，还要保证成对索引或链表/哈希表同步更新，其他 I/O 线程不会观察到一半完成的状态。
 
 ## 面试重点
 
-重要性最高。常见问题：如何防重复、如何避免消息丢失、跨节点如何找人、重复登录如何解决、为什么 ACK_FAIL 要撤销去重标记、连接身份绑定如何阻止伪造。还应主动说明边界：当前是“至少一次重试 + 服务端去重”，离线消息拉取尚不是严格事务型消费，RabbitMQ 使用自动 ACK 也存在极端故障窗口。
+- 能否沿着一条单聊消息说明本地直发、跨节点路由、离线落库、ACK 与重试之间的成功语义？
+
+- Redis 或 RabbitMQ 故障时系统如何降级，哪些保证仍成立，哪些保证会变弱？
+
+- 为什么“至少一次发送 + message_id 幂等”不等于严格 Exactly Once？

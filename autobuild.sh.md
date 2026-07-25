@@ -2,17 +2,33 @@
 
 ## 作用概览
 
-这是本机一键构建脚本：定位项目根目录，生成 Debug 构建，进行并行编译并执行全部 CTest。
+**本机构建脚本。** 顺序创建构建目录、运行 CMake 并并行编译，给学习者提供比手写多条命令更稳定的入口。
 
-## 按学习顺序讲解
+阅读位置：`autobuild.sh`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-1. `set -euo pipefail`：任一命令失败、使用未定义变量或管道失败都会立即退出。
-2. `project_dir=...`：基于脚本自身位置确定根目录，因此可从任意当前目录调用。
-3. `cmake -S/-B`：分离源码目录和 `build` 构建目录。
-4. `cmake --build --parallel`：并行编译。
-5. `ctest --output-on-failure`：运行测试，失败时打印详情。
+## 代码片段与详细讲解
+
+### 片段 1：第 1-12 行
+
+```bash
+#!/usr/bin/env bash
+# -e: 任一步失败即退出；-u: 未定义变量视为错误；pipefail: 管道中任一命令失败即失败。
+set -euo pipefail
+
+# 基于脚本自身位置定位项目，避免调用者当前目录影响相对路径。
+project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 使用源码/构建目录分离的 Debug 构建，便于本地断点和错误定位。
+cmake -S "$project_dir" -B "$project_dir/build" -DCMAKE_BUILD_TYPE=Debug
+# 让 CMake 按可用 CPU 并行调度，不把编译器参数写死在脚本中。
+cmake --build "$project_dir/build" --parallel
+# 执行已注册的无外部依赖核心测试；失败时展开测试程序输出。
+ctest --test-dir "$project_dir/build" --output-on-failure
+```
+
+这段 DDL/DML 把运行前必须存在的数据库结构一次性建立起来。字段类型和索引围绕实际查询设计：用户 id 用于关系连接，离线消息按用户过滤并按自增 id 排序。
 
 ## 面试重点
 
-重要性较低。可能问题：为什么不用手写 `g++`？CMake 能统一管理多目标、头文件、外部库和测试依赖。
+- 从空环境到服务可访问，构建、配置、健康检查和启动依赖的顺序是什么？
 
+- 哪些值应通过环境变量注入，哪些文件或产物不应进入版本库？

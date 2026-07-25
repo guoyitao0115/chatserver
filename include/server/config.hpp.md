@@ -2,36 +2,95 @@
 
 ## 作用概览
 
-该头文件提供轻量环境变量读取函数，让服务端无需引入配置框架即可安全读取字符串和有范围约束的整数。
+**环境配置读取工具。** 把“环境变量存在且合法则覆盖，否则使用默认值”的规则封装起来，供数据库、Redis、RabbitMQ 和监听端口共享。
 
-## 按学习顺序讲解
+阅读位置：`include/server/config.hpp`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-### `envOr(name, fallback)`
+## 代码片段与详细讲解
 
-读取环境变量；变量不存在或为空字符串时返回默认值。适合主机名、用户名、exchange 等字符串。
+### 片段 1：第 1-25 行
 
-### `envIntOr(name, fallback, minValue, maxValue)`
+```cpp
+#ifndef CHAT_CONFIG_HPP
+#define CHAT_CONFIG_HPP
 
-使用 `strtol` 严格解析十进制整数，同时检查系统错误、未消费字符和上下界；任何异常都回退默认值。默认范围 1～65535 正好覆盖 TCP/UDP 端口。
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
+#include <string>
 
-## 函数详细说明
+namespace chatserver
+{
+namespace config
+{
 
-### `envOr(const char *name, const std::string &fallback)`
+/**
+ * 读取非空环境变量；变量不存在或值为空字符串时返回默认值。
+ *
+ * 该函数只复制进程环境中的内容，不保留 getenv() 返回指针，因此返回值不受后续
+ * 环境变量修改影响。适合读取主机名、用户名、交换机名等字符串配置；若“空字符串”
+ * 本身是合法配置，则不应使用此函数。
+ */
+inline std::string envOr(const char *name, const std::string &fallback)
+{
+    const char *value = std::getenv(name);
+    return value != nullptr && *value != '\0' ? value : fallback;
+}
+```
 
-- **参数**：`name` 是环境变量名，`fallback` 是缺失或空值时使用的默认字符串。
-- **返回**：返回一个新的 `std::string`，不会把 `getenv` 返回的进程环境指针暴露给调用方。
-- **判断逻辑**：同时检查指针非空和首字符非 `\0`；显式设置为空字符串与未设置具有相同语义。
-- **使用位置**：MySQL、RabbitMQ、节点 ID 等字符串配置。它不校验主机名或凭据内容，语义校验由对应组件承担。
+本片段读取 ``。未设置时采用紧邻的本机默认值；容器部署则覆盖这些值，因此同一二进制可以作为不同节点运行，无需重新编译。
 
-### `envIntOr(const char *name, int fallback, int minValue, int maxValue)`
+### 片段 2：第 26-53 行
 
-- **参数**：变量名、默认值和允许闭区间；端口调用通常使用默认 1～65535，其他整数也可自定义范围。
-- **解析步骤**：读取字符串 → 清零 `errno` → `strtol` 十进制解析 → 检查溢出、是否完全未解析、尾部是否还有字符和范围。
-- **返回**：所有检查通过才转为 `int`；任一失败均返回 fallback，不向调用方抛异常。
-- **典型边界**：`7000x`、空串、负数、超范围和 long 溢出都不会被部分接受。
-- **权衡**：回退保证服务可启动，但生产系统还可在非法关键配置时选择 fail-fast，避免静默使用错误默认值。
+```cpp
 
+/**
+ * 读取并严格解析十进制整数环境变量。
+ *
+ * @param name 环境变量名，必须是有效的 C 字符串。
+ * @param fallback 缺失、空值、格式错误、溢出或越界时采用的安全默认值。
+ * @param minValue/maxValue 闭区间范围，默认适配 TCP/AMQP 端口。
+ * @return 校验通过的 int，或 fallback；本函数不抛出配置解析异常。
+ *
+ * strtol 后同时检查 errno、是否消费到数字和是否完整消费字符串，因此 "12x"、
+ * 空白尾缀以及超出 long 范围的值都不会被悄悄接受。调用者应保证 minValue 不大于
+ * maxValue，并保证 fallback 本身符合业务约束。
+ */
+inline int envIntOr(const char *name, int fallback, int minValue = 1, int maxValue = 65535)
+{
+    const char *value = std::getenv(name);
+    if (value == nullptr || *value == '\0')
+    {
+        return fallback;
+    }
+
+    errno = 0;
+    char *end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed < minValue || parsed > maxValue)
+    {
+        return fallback;
+    }
+```
+
+这一接口片段规定“环境配置读取工具”对外可用的操作和对象必须长期保存的状态。调用者只依赖这里的契约；锁、SQL、网络错误和资源释放留在实现内部，因此更换基础设施不会迫使业务处理器改写所有调用点。
+
+### 片段 3：第 54-60 行
+
+```cpp
+    return static_cast<int>(parsed);
+}
+
+} // namespace config
+} // namespace chatserver
+
+#endif
+```
+
+这一接口片段规定“环境配置读取工具”对外可用的操作和对象必须长期保存的状态。调用者只依赖这里的契约；锁、SQL、网络错误和资源释放留在实现内部，因此更换基础设施不会迫使业务处理器改写所有调用点。 整数配置只有在完整解析且位于允许区间时才转换返回；尾随字符、溢出或越界都会使用 fallback，防止非法端口进入监听或连接调用。
 
 ## 面试重点
 
-重要性中等。可能问题：为何不用 `atoi`？`atoi` 无法可靠区分非法输入和 0，也不报告溢出；为何做范围校验？避免错误端口或负数进入底层库。
+- 这个文件处于哪一层，它保存的数据由谁创建、由谁消费？
+
+- 如果删除或修改本文件，最先受影响的运行链路是什么？

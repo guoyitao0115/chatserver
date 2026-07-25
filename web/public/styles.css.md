@@ -2,22 +2,193 @@
 
 ## 作用概览
 
-该文件实现登录页和聊天页的全部视觉样式，使用 CSS 变量、Grid/Flex、毛玻璃面板、消息气泡和两个响应式断点，无外部 UI 框架。
+**聊天页面样式。** 用两栏布局、状态色和响应式规则呈现桌面及窄屏界面。类名与 `app.js` 动态切换的 active/online/pending 状态对应。
 
-## 按学习顺序讲解
+阅读位置：`web/public/styles.css`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-1. `:root`：集中定义颜色、阴影和字体 token，后续主题调整只改一处。
-2. 全局规则：统一盒模型、基础控件字体、隐藏工具类和页面背景。
-3. 登录区：双栏品牌/认证卡布局，tab、表单、焦点、按钮和在线状态。
-4. 聊天区：`.chat-view` 两列网格；侧边栏内部用 Flex，消息区用三行 Grid。
-5. 会话列表：按钮化条目提供 hover/active 状态，头像与状态文本保持可截断。
-6. 消息气泡：`.mine` 控制左右方向和颜色；`white-space: pre-wrap` 与 `overflow-wrap:anywhere` 保留换行并防长文本撑破布局。
-7. dialog/toast：原生模态框和动画提示。
-8. `@media 860px/650px`：平板缩小侧栏，手机改为上下布局和横向会话列表。
+## 代码片段与详细讲解
 
-本文件无函数，按选择器和响应式层次学习。
+### 片段 1：第 1-30 行
+
+```css
+/*
+ * 页面视觉层只负责布局和状态呈现，不承载业务逻辑。
+ * 颜色、阴影和字号集中为设计令牌；布局在 860px、650px 两个断点渐进收缩。
+ */
+:root {
+  color-scheme: light;
+  --ink: #182b2a;
+  --muted: #6f7f7b;
+  --paper: #f4f1e9;
+  --panel: rgba(255, 255, 255, 0.78);
+  --line: rgba(24, 43, 42, 0.12);
+  --green: #1f6f61;
+  --green-deep: #165549;
+  --mint: #cfe5dc;
+  --peach: #e78a65;
+  --shadow: 0 28px 80px rgba(35, 59, 54, 0.14);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+/* 全局基础规则：border-box 使声明宽度包含内边距和边框，减少响应式尺寸计算偏差。 */
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; min-height: 100vh; color: var(--ink); background: var(--paper); overflow-x: hidden; }
+button, input { font: inherit; }
+button { cursor: pointer; }
+/* JS 用同一个工具类切换登录/聊天、表单和弹窗字段；important 保证不会被组件 display 覆盖。 */
+.hidden { display: none !important; }
+/* 环境光是 fixed 装饰层，禁用鼠标事件，避免覆盖在输入控件上方。 */
+.ambient { position: fixed; width: 32rem; height: 32rem; border-radius: 50%; filter: blur(3px); opacity: .48; pointer-events: none; }
+.ambient-one { background: radial-gradient(circle, #bfdcce 0, rgba(191, 220, 206, 0) 68%); top: -12rem; left: -8rem; }
+.ambient-two { background: radial-gradient(circle, #f0c1a9 0, rgba(240, 193, 169, 0) 68%); right: -10rem; bottom: -15rem; }
+```
+
+选择器对应页面中的固定结构或脚本动态添加的状态类。布局属性决定区域尺寸与滚动边界，颜色和可见性属性把在线、选中、待发送等业务状态转化为用户可见反馈。
+
+### 片段 2：第 31-60 行
+
+```css
+.shell { position: relative; width: min(1180px, calc(100% - 40px)); min-height: 100vh; margin: 0 auto; display: grid; place-items: center; padding: 40px 0; }
+/* 桌面登录页采用品牌介绍 + 表单双栏，右栏稍窄以维持清晰的信息层级。 */
+.auth-view { width: 100%; display: grid; grid-template-columns: 1.15fr .85fr; gap: 64px; align-items: center; }
+.brand-panel { padding: 36px 10px; }
+.brand-mark { width: 58px; height: 58px; display: grid; place-items: center; border-radius: 18px 18px 18px 5px; color: #fff; background: var(--green); font: 700 25px/1 Georgia, serif; box-shadow: 0 15px 32px rgba(31, 111, 97, .2); }
+.brand-mark.small { width: 37px; height: 37px; border-radius: 12px 12px 12px 4px; font-size: 17px; }
+.eyebrow, .form-kicker { margin: 26px 0 10px; color: var(--green); font-size: 11px; font-weight: 800; letter-spacing: .18em; }
+.brand-panel h1 { margin: 0; max-width: 700px; font: 600 clamp(44px, 6vw, 76px)/1.08 Georgia, "Noto Serif SC", serif; letter-spacing: -.035em; }
+.brand-copy { max-width: 590px; margin: 28px 0; color: var(--muted); font-size: 17px; line-height: 1.8; }
+.feature-row { display: flex; flex-wrap: wrap; gap: 10px; }
+.feature-row span { padding: 8px 12px; border: 1px solid var(--line); border-radius: 999px; background: rgba(255,255,255,.42); font-size: 13px; }
+/* 半透明面板配合 backdrop-filter；不支持模糊的浏览器仍会显示可读的 rgba 背景。 */
+.auth-card { padding: 34px; border: 1px solid rgba(255,255,255,.8); border-radius: 30px; background: var(--panel); box-shadow: var(--shadow); backdrop-filter: blur(18px); }
+.tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px; border-radius: 13px; background: rgba(31, 111, 97, .07); }
+.tab { padding: 10px; border: 0; border-radius: 10px; color: var(--muted); background: transparent; }
+.tab.active { color: var(--ink); background: #fff; box-shadow: 0 4px 14px rgba(35,59,54,.08); font-weight: 700; }
+.auth-form { display: grid; gap: 18px; margin-top: 30px; }
+.auth-form h2, .dialog-heading h2 { margin: 0; font: 600 28px/1.2 Georgia, "Noto Serif SC", serif; }
+.auth-form .form-kicker, .dialog-heading .form-kicker { margin: 0 0 8px; }
+label { display: grid; gap: 8px; color: #425552; font-size: 13px; font-weight: 700; }
+input { width: 100%; padding: 13px 15px; border: 1px solid var(--line); border-radius: 12px; outline: none; color: var(--ink); background: rgba(255,255,255,.72); transition: border-color .2s, box-shadow .2s; }
+/* 使用清晰的焦点环，而不是移除 outline 后不给键盘用户任何反馈。 */
+input:focus { border-color: var(--green); box-shadow: 0 0 0 4px rgba(31,111,97,.1); }
+.primary, .secondary, .quiet-button, .send-button { border: 0; border-radius: 12px; }
+.primary { padding: 13px 18px; color: #fff; background: var(--green); font-weight: 800; box-shadow: 0 10px 24px rgba(31,111,97,.2); }
+.primary:hover { background: var(--green-deep); }
+.form-message { min-height: 20px; margin: 18px 0 0; color: #b94f35; font-size: 13px; }
+.connection-line { display: flex; align-items: center; gap: 8px; margin-top: 14px; color: var(--muted); font-size: 12px; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; background: #d08b6f; box-shadow: 0 0 0 4px rgba(208,139,111,.12); }
+.status-dot.online { background: #4b9a76; box-shadow: 0 0 0 4px rgba(75,154,118,.12); }
+```
+
+这些规则作用于 `.shell`、`.auth-view`、`.brand-panel`、`.brand-mark`、`.brand-mark.small`，主要调整 `input`。布局尺寸决定列表和消息区各自滚动，状态选择器只改变视觉反馈，不会修改 JavaScript 中的会话数据。
+
+### 片段 3：第 61-90 行
+
+```css
+
+/* 聊天主体固定为侧栏 + 自适应内容区；min-width:0 允许长文本在 Grid 子项内正确收缩。 */
+.chat-view { width: 100%; height: min(800px, calc(100vh - 70px)); min-height: 620px; display: grid; grid-template-columns: 320px 1fr; overflow: hidden; border: 1px solid rgba(255,255,255,.85); border-radius: 30px; background: rgba(255,255,255,.72); box-shadow: var(--shadow); backdrop-filter: blur(20px); }
+.sidebar { display: flex; min-width: 0; flex-direction: column; padding: 24px; border-right: 1px solid var(--line); background: rgba(247,248,243,.72); }
+.sidebar-header, .brand-small, .profile-card, .conversation-header { display: flex; align-items: center; }
+.sidebar-header { justify-content: space-between; }
+.brand-small { gap: 10px; }
+.brand-small strong { font-family: Georgia, "Noto Serif SC", serif; font-size: 20px; }
+.quiet-button { padding: 8px 10px; color: var(--muted); background: transparent; }
+.quiet-button:hover { color: var(--ink); background: rgba(31,111,97,.07); }
+.profile-card { position: relative; gap: 12px; margin: 28px 0 20px; padding: 15px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.68); }
+.avatar { width: 42px; height: 42px; display: grid; flex: 0 0 auto; place-items: center; border-radius: 13px; color: var(--green-deep); background: var(--mint); font-weight: 900; }
+.profile-card div:nth-child(2) { display: grid; gap: 3px; min-width: 0; }
+.profile-card strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.profile-card small { color: var(--muted); }
+.online-pill { margin-left: auto; color: var(--green); font-size: 11px; font-weight: 800; }
+.list-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.list-tab { padding: 9px; border: 0; border-bottom: 2px solid transparent; color: var(--muted); background: transparent; }
+.list-tab.active { border-bottom-color: var(--green); color: var(--ink); font-weight: 800; }
+/* 左栏与消息区分别滚动，页面外壳保持稳定，不因历史消息增长而无限变高。 */
+.conversation-list { flex: 1; overflow-y: auto; padding: 12px 0; }
+.conversation-item { width: 100%; display: flex; align-items: center; gap: 11px; padding: 11px; border: 0; border-radius: 14px; text-align: left; color: var(--ink); background: transparent; }
+.conversation-item:hover, .conversation-item.active { background: rgba(31,111,97,.08); }
+.conversation-item .avatar { width: 38px; height: 38px; border-radius: 12px; }
+.conversation-item span { display: grid; gap: 2px; min-width: 0; }
+.conversation-item small { color: var(--muted); }
+.secondary { padding: 11px 14px; border: 1px solid var(--line); color: var(--green-deep); background: rgba(255,255,255,.58); font-weight: 800; }
+.full { width: 100%; }
+.conversation { min-width: 0; display: grid; grid-template-rows: auto 1fr auto; }
+.conversation-header { justify-content: space-between; min-height: 94px; padding: 20px 28px; border-bottom: 1px solid var(--line); }
+```
+
+这些规则作用于 `.chat-view`、`.sidebar`、`.sidebar-header, .brand-small, .profile-card, .conversation-header`、`.sidebar-header`、`.brand-small`，主要调整 ``。布局尺寸决定列表和消息区各自滚动，状态选择器只改变视觉反馈，不会修改 JavaScript 中的会话数据。
+
+### 片段 4：第 91-118 行
+
+```css
+.conversation-header .eyebrow { margin: 0 0 5px; }
+.conversation-header h2 { margin: 0; font: 600 24px/1.2 Georgia, "Noto Serif SC", serif; }
+.conversation-meta { color: var(--muted); font-size: 12px; }
+.message-list { overflow-y: auto; padding: 28px; background: linear-gradient(rgba(255,255,255,.14), rgba(244,241,233,.4)); }
+.empty-state { height: 100%; display: grid; align-content: center; justify-items: center; color: var(--muted); text-align: center; }
+.empty-state span { width: 62px; height: 62px; display: grid; place-items: center; border-radius: 20px 20px 20px 6px; color: var(--green); background: var(--mint); font: 700 22px Georgia, serif; }
+.empty-state h3 { margin: 18px 0 5px; color: var(--ink); }
+.empty-state p { margin: 0; }
+.message-row { display: flex; margin: 13px 0; }
+.message-row.mine { justify-content: flex-end; }
+/* 气泡限制最大宽度；pre-wrap 保留用户换行，anywhere 防止超长连续字符撑破布局。 */
+.bubble { max-width: min(70%, 560px); padding: 11px 14px; border-radius: 5px 16px 16px 16px; background: #fff; box-shadow: 0 4px 18px rgba(35,59,54,.07); }
+.mine .bubble { border-radius: 16px 5px 16px 16px; color: #fff; background: var(--green); }
+.bubble-header { display: flex; gap: 8px; margin-bottom: 5px; color: var(--muted); font-size: 10px; }
+.mine .bubble-header { color: rgba(255,255,255,.7); }
+.bubble p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; }
+.delivery { display: block; margin-top: 5px; opacity: .7; font-size: 9px; text-align: right; }
+.composer { display: grid; grid-template-columns: 1fr auto; gap: 10px; padding: 18px 24px; border-top: 1px solid var(--line); background: rgba(255,255,255,.58); }
+.composer input { padding: 14px 17px; border-radius: 15px; }
+.send-button { padding: 0 22px; color: #fff; background: var(--peach); font-weight: 800; }
+.send-button:disabled, input:disabled { cursor: not-allowed; opacity: .5; }
+/* 原生 dialog 自带模态焦点管理；backdrop 明确区分当前操作与底层聊天内容。 */
+dialog { width: min(440px, calc(100% - 32px)); padding: 0; border: 0; border-radius: 24px; color: var(--ink); background: #faf9f5; box-shadow: var(--shadow); }
+dialog::backdrop { background: rgba(24,43,42,.35); backdrop-filter: blur(4px); }
+#action-form { display: grid; gap: 18px; padding: 28px; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.toast { position: fixed; left: 50%; bottom: 26px; z-index: 10; max-width: calc(100% - 32px); padding: 11px 16px; border-radius: 999px; color: #fff; background: var(--ink); box-shadow: 0 10px 30px rgba(24,43,42,.22); opacity: 0; transform: translate(-50%, 12px); pointer-events: none; transition: .2s; }
+.toast.show { opacity: 1; transform: translate(-50%, 0); }
+```
+
+这些规则作用于 `.conversation-header .eyebrow`、`.conversation-header h2`、`.conversation-meta`、`.message-list`、`.empty-state`，主要调整 `dialog`。布局尺寸决定列表和消息区各自滚动，状态选择器只改变视觉反馈，不会修改 JavaScript 中的会话数据。
+
+### 片段 5：第 119-144 行
+
+```css
+
+/* 中等屏幕压缩列宽，仍保留左右双栏聊天体验。 */
+@media (max-width: 860px) {
+  .auth-view { grid-template-columns: 1fr; gap: 10px; }
+  .brand-panel { padding-bottom: 10px; }
+  .brand-panel h1 { font-size: clamp(42px, 12vw, 64px); }
+  .chat-view { grid-template-columns: 260px 1fr; }
+}
+
+/* 手机端改为“上方会话导航 + 下方消息区”，会话列表横向滚动以节省高度。 */
+@media (max-width: 650px) {
+  .shell { width: min(100% - 20px, 560px); padding: 18px 0; }
+  .auth-card { padding: 25px; border-radius: 22px; }
+  .brand-panel { padding: 18px 4px; }
+  .brand-panel h1 { font-size: 42px; }
+  .chat-view { height: calc(100vh - 36px); min-height: 620px; grid-template-columns: 1fr; grid-template-rows: 285px 1fr; border-radius: 22px; }
+  .sidebar { padding: 16px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .profile-card { margin: 13px 0 8px; padding: 9px 12px; }
+  .conversation-list { display: flex; gap: 6px; padding: 7px 0; overflow-x: auto; }
+  .conversation-item { flex: 0 0 auto; width: auto; }
+  .conversation-item span { display: none; }
+  .conversation-header { min-height: 72px; padding: 14px 18px; }
+  .message-list { padding: 18px; }
+  .composer { padding: 12px; }
+  .bubble { max-width: 86%; }
+}
+```
+
+这些规则作用于 `@media (max-width: 860px)`、`.auth-view`、`.brand-panel`、`.brand-panel h1`、`.chat-view`，主要调整 ``。布局尺寸决定列表和消息区各自滚动，状态选择器只改变视觉反馈，不会修改 JavaScript 中的会话数据。
 
 ## 面试重点
 
-重要性较低。可能问题：为什么用 CSS 变量和 Grid/Flex；长消息如何防溢出；移动端如何重排。视觉不是后端面试核心，但能体现完整交付能力。
+- 这个文件处于哪一层，它保存的数据由谁创建、由谁消费？
 
+- 如果删除或修改本文件，最先受影响的运行链路是什么？

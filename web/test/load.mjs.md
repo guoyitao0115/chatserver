@@ -2,74 +2,207 @@
 
 ## 作用概览
 
-该脚本建立多对 WebSocket 客户端并并发发送消息，验证高负载下 ACK、收件、唯一性和顺序，同时输出吞吐与端到端延迟分位数。
+**并发负载测试。** 创建多组独立发送/接收连接，突发发送带序号消息，同时统计 ACK、实际投递、重复、乱序、吞吐和延迟分位数。
 
-## 按学习顺序讲解
+阅读位置：`web/test/load.mjs`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-- 配置：默认 30 对连接、每对 50 条，可用 `CHAT_LOAD_*` 调整；两个端口不同表示跨节点。
-- `percentile(sorted,ratio)`：在已排序延迟数组上取 nearest-rank 分位值。
-- 初始化阶段并行创建每对发送者/接收者、注册与登录，并记录 setup 时间。
-- 采集器阶段先注册 ACK 和 delivery 的 `collect`，再发送，避免快速响应先到导致漏观察。
-- 发送阶段为每对分配独立前缀、`client_seq` 和时间戳。
-- 结果阶段检查期望总数、所有 ACK_OK、唯一 ID、无延迟重复、每对顺序；计算吞吐、lost、duplicates、order violations 及 min/p50/p95/p99/max。
-- `finally` 清连接。
+## 代码片段与详细讲解
 
-## 函数详细说明
+### 片段 1：第 1-22 行
 
-### `percentile(sorted, ratio)`
+```javascript
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 
-输入必须是升序数组。空数组返回 0；非空时使用 nearest-rank 思路计算 `ceil(n × ratio) - 1` 下标，并限制在最后一个元素以内。`p95` 表示约 95% 样本延迟不超过该值，比平均数更容易暴露少量慢请求。
+import { MSG, createClient, delay, login, register } from './e2e-client.mjs';
 
-函数不负责排序，调用方先按数值升序处理延迟。如果样本数很小，p99 往往就是最大值，报告时应同时给出样本量。
+// 负载测试默认同时打到两个 Web 网关端口。两个端口相同时验证单节点吞吐，
+// 不同时验证跨 Web 网关、跨后端节点时 Redis/RabbitMQ 协同是否仍然稳定。
+const port1 = Number(process.env.CHAT_E2E_PORT_1 ?? 8080);
+const port2 = Number(process.env.CHAT_E2E_PORT_2 ?? 8081);
 
-### 配置读取
+// pairCount 控制并发发送/接收用户对数，messagesPerPair 控制每对用户的消息量。
+// 面试里常被追问“高并发下是否丢消息/乱序/重复”，这两个参数就是调压入口。
+const pairCount = Number(process.env.CHAT_LOAD_PAIRS ?? 30);
+const messagesPerPair = Number(process.env.CHAT_LOAD_MESSAGES ?? 50);
+const timeoutMs = Number(process.env.CHAT_LOAD_TIMEOUT_MS ?? 180_000);
+const crossNode = port1 !== port2;
+const password = 'load-demo-123';
 
-脚本从环境读取两个网关端口、并发会话对数、每对消息数和总超时，未设置时使用适合本地的默认值。`crossNode` 只根据端口是否不同判断拓扑；运行脚本的人仍需保证这两个网关背后确实连接不同 C++ 节点。
+// 后缀和 message_id 前缀保证每次测试数据互不干扰，即使数据库里保留旧记录，
+// 本轮断言也只统计本轮产生的消息。
+const suffix = `${Date.now()}-${crypto.randomInt(1000, 9999)}`;
+const clients = [];
+```
 
-用户名和消息 ID都带时间随机后缀，使重复压测不会与旧数据库记录或 Redis 去重键冲突。
+这些依赖明确了本片段所在层的边界：Redis、RabbitMQ、密码或随机数、断言框架。项目内部头文件提供协议和领域对象，外部库只承担基础能力；业务数据如何流转仍由当前模块决定。
 
-### 初始化阶段
+`CHAT_E2E_PORT_1`、`CHAT_E2E_PORT_2`、`CHAT_LOAD_PAIRS`、`CHAT_LOAD_MESSAGES`、`CHAT_LOAD_TIMEOUT_MS` 把拓扑、并发用户对数、每对消息量和总超时暴露给运行者。同一脚本既能以两个不同端口压跨节点链路，也能把端口设成相同值只测单节点。
 
-`Promise.all(Array.from(...))` 并发创建每一对 sender/receiver。每个 pair 的两端分别连接 port1、port2，注册也并行执行，随后并行登录并断言成功。返回结构保存 index、两个客户端和两个用户 ID，后续所有消息都可按 pair 精确归属。
+并发操作在等待器或收集器就绪后同时启动，避免响应太快而被测试代码错过。这里关注的是共享状态竞争：例如重复登录只能有一个赢家，或多连接突发发送后每组仍必须收齐自己的消息。
 
-`setupMs` 单独计量连接、注册和登录成本，不计入纯消息吞吐。客户端在创建后立即放入全局数组，后续步骤失败时 finally 仍能关闭已完成的部分。
+### 片段 2：第 23-52 行
 
-### 采集器注册阶段
+```javascript
 
-对每个 pair 预先调用 sender.collect 等待指定前缀的 ACK，并在 receiver 上等待相同数量的单聊。先注册再发送可以避免本机回环和快速服务在循环尚未建立观察器时就返回大量消息。每个前缀包含 pair index，防止不同并发会话互相消费响应。
+// 输入数组在调用前已经排序。使用 ceil 可以得到常见监控口径中的 p50/p95/p99，
+// 空数组返回 0，避免测试失败时统计阶段再抛出二次异常遮蔽真正原因。
+function percentile(sorted, ratio) {
+  if (sorted.length === 0) return 0;
+  return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * ratio) - 1)];
+}
 
-### 消息发送阶段
+try {
+  // 先批量完成注册和登录，把用户创建耗时与真正的消息吞吐耗时分开统计。
+  // 每个 pair 使用独立发送者和接收者，可以暴露连接数增长时的状态隔离问题。
+  const setupStartedAt = Date.now();
+  const pairs = await Promise.all(Array.from({ length: pairCount }, async (_, index) => {
+    const sender = await createClient(port1, { timeoutMs });
+    const receiver = await createClient(port2, { timeoutMs });
+    clients.push(sender, receiver);
+    const [senderId, receiverId] = await Promise.all([
+      register(sender, `压测发送-${suffix}-${index}`, password, timeoutMs),
+      register(receiver, `压测接收-${suffix}-${index}`, password, timeoutMs),
+    ]);
+    const [senderLogin, receiverLogin] = await Promise.all([
+      login(sender, senderId, password, timeoutMs),
+      login(receiver, receiverId, password, timeoutMs),
+    ]);
+    assert.equal(senderLogin.errno, 0);
+    assert.equal(receiverLogin.errno, 0);
+    return { index, sender, receiver, senderId, receiverId };
+  }));
+  const setupMs = Date.now() - setupStartedAt;
+  const prefix = `load-${suffix}-`;
+```
 
-记录 `startedAt` 后，双层循环为每对快速发送连续消息。payload 包含发送/接收身份、唯一 ID、`client_seq`、ISO 时间和毫秒时间。每个 pair 序列从 1 独立增长，正好对应后面的会话内顺序断言。
+延迟数组已升序排列，函数按 nearest-rank 口径选择 p50/p95/p99；使用上取整可确保分位点代表至少相应比例样本不超过该值。
 
-当前循环在单个 Node 线程中依次调用 write，属于多连接快速突发，并非所有连接在完全同一个纳秒发送。socket 和服务端并发仍会形成高负载；需要更严格同步可先构造任务并使用屏障统一放行。
+### 片段 3：第 53-78 行
 
-### 收集与延迟重复观察
+```javascript
 
-`Promise.all` 等待每对 ACK、delivery 都达到期望数量，之后计算消息阶段 elapsed。脚本再等待 500ms，并用 `drain` 取出同批前缀的额外消息。这个额外窗口专门检测主要 collect 已收满以后才到达的重复投递。
+  // collect 在发送前启动，防止高并发下服务端太快返回 ACK 或投递消息，
+  // 导致测试代码还没开始等待就错过事件。
+  const collectors = pairs.map(({ index, sender, receiver }) => ({
+    ack: sender.collect((m) => m.msgid === MSG.ACK && String(m.message_id).startsWith(`${prefix}${index}-`), messagesPerPair, timeoutMs),
+    delivery: receiver.collect((m) => m.msgid === MSG.ONE_CHAT && String(m.message_id).startsWith(`${prefix}${index}-`), messagesPerPair, timeoutMs),
+  }));
 
-500ms 之外的极迟重复不会被本次发现，因此应结合系统重试周期调整观察时间；可靠性脚本还提供独立负断言。
+  // 同步快速写入所有 pair 的消息，模拟客户端短时间突发发送。
+  // client_seq 和 sent_at_ms 是后续顺序、延迟断言的依据。
+  const startedAt = Date.now();
+  for (const pair of pairs) {
+    for (let sequence = 1; sequence <= messagesPerPair; sequence += 1) {
+      const sentAt = Date.now();
+      pair.sender.send({
+        msgid: MSG.ONE_CHAT,
+        id: pair.senderId,
+        toid: pair.receiverId,
+        name: `压测发送-${pair.index}`,
+        msg: `并发消息-${sequence}`,
+        time: new Date(sentAt).toISOString(),
+        sent_at_ms: sentAt,
+        client_seq: sequence,
+        message_id: `${prefix}${pair.index}-${sequence}`,
+      });
+    }
+```
 
-### 正确性统计与断言
+每个用户对在发送前建立 ACK 与 delivery 收集器，然后突发写入独立 message_id/序号。完成后把各组结果展平：总数衡量丢失，Set 衡量重复，逐组 client_seq 衡量会话顺序，接收时间减 sent_at_ms 形成延迟样本。
 
-脚本展开全部 ACK 和收到消息，计算期望总数、唯一 ID 数与每个 pair 的序列违规数。它要求 ACK 数等于期望且全部 `ACK_OK`，delivery 数等于期望，唯一 ID 数也等于期望，额外消息为 0，顺序违规为 0。
+循环每次只消费已经确认完整的字节或已经成功写出的部分。遇到正文尚未到齐便停在当前偏移，下一次收到数据后继续；发送短写则从剩余位置续发，这正是流式 socket 不能假设“一次调用完成一条消息”的原因。
 
-这些断言使压测不仅输出一个好看的 QPS：如果系统通过丢消息、重复投递或错误 ACK 换取速度，脚本会直接失败。
+### 片段 4：第 79-106 行
 
-### 吞吐和延迟计算
+```javascript
+  }
 
-每条消息在解析时由公共客户端记录 `__receivedAt`，减去 payload 的 `sent_at_ms` 得到端到端近似延迟。排序后输出 min、p50、p95、p99 和 max。吞吐使用期望消息数除以从开始发送到全部 ACK/收件完成的秒数，不包含 setup。
+  // 同时等待 ACK 和投递完成：ACK 证明服务端已接受/处理，delivery 证明接收端实际收到。
+  // 两者都检查才能覆盖“发送方以为成功但接收方没收到”的故障形态。
+  const settled = await Promise.all(collectors.flatMap(({ ack, delivery }) => [ack, delivery]));
+  const elapsedMs = Date.now() - startedAt;
+  const ackGroups = settled.filter((_, index) => index % 2 === 0);
+  const deliveryGroups = settled.filter((_, index) => index % 2 === 1);
 
-发送端和接收端在同一机器时钟域，差值可用；跨机器时需要时钟同步或改用服务端分段指标。客户端事件循环、JSON 解析和单机网络也属于测得延迟的一部分。
+  // 多等半秒再 drain，是为了捕获正常收满之后才迟到的重复投递。
+  await delay(500);
 
-### 结果输出
+  const allAcks = ackGroups.flat();
+  const allDeliveries = deliveryGroups.flat();
+  const extraDeliveries = pairs.flatMap(({ index, receiver }) => receiver.drain(
+    (m) => m.msgid === MSG.ONE_CHAT && String(m.message_id).startsWith(`${prefix}${index}-`),
+  ));
+  const expected = pairCount * messagesPerPair;
+  const uniqueIds = new Set(allDeliveries.map((message) => message.message_id));
 
-JSON 报告包括节点数、WebSocket 并发数、pair 数、总消息数、是否跨节点、setup/运行时间、吞吐、ACK/收件数、丢失、重复、乱序和延迟分位。结构化输出便于 Shell 保存或 CI 解析，不应只靠人工看日志。
+  // 这里检查的是“同一个发送者到同一个接收者”的顺序。不同 pair 之间没有全局顺序要求，
+  // 因为并发连接天然会交错，要求全局有序反而会误判系统设计。
+  const orderViolations = deliveryGroups.reduce((total, messages) => total + messages.reduce(
+    (violations, message, index) => violations + (message.client_seq === index + 1 ? 0 : 1), 0,
+  ), 0);
+  const latencies = allDeliveries
+    .map((message) => message.__receivedAt - message.sent_at_ms)
+    .sort((a, b) => a - b);
+```
 
-### `finally` 清理
+这部分属于“并发负载测试”的状态衔接代码。它只推进当前事件已经确认的结果；异步响应、未匹配消息或未完成缓冲仍保存在本模块中，后续事件到达后继续处理，不会被当作空结果丢弃。
 
-逐个关闭已创建客户端。即使某一 pair 注册失败、collect 超时或正确性断言失败，finally 也会执行，避免数十条长连接继续占用网关和 C++ 服务资源。
+### 片段 5：第 107-136 行
+
+```javascript
+
+  // 负载测试的核心可靠性断言：ACK 不丢、投递不丢、message_id 不重复、
+  // 稳定窗口内没有额外重复消息、同一发送者的消息保持顺序。
+  assert.equal(allAcks.length, expected, 'all messages must have an ACK');
+  assert.ok(allAcks.every((ack) => ack.ack_state === 0), 'all load-test ACK states must be OK');
+  assert.equal(allDeliveries.length, expected, 'all messages must arrive');
+  assert.equal(uniqueIds.size, expected, 'received message ids must be unique');
+  assert.equal(extraDeliveries.length, 0, 'no delayed duplicate messages are allowed');
+  assert.equal(orderViolations, 0, 'per-sender order must be preserved');
+
+  // 输出机器可读 JSON，方便复制进测试报告，也方便后续接入 CI 做趋势对比。
+  console.log(JSON.stringify({
+    status: 'passed',
+    topology: { serviceNodes: crossNode ? 2 : 1, concurrentWebSockets: pairCount * 2, pairs: pairCount },
+    workload: { messagesPerPair, totalMessages: expected, crossNode },
+    result: {
+      setupMs,
+      elapsedMs,
+      throughputMessagesPerSecond: Number((expected / (elapsedMs / 1000)).toFixed(2)),
+      acked: allAcks.length,
+      received: allDeliveries.length,
+      lost: expected - uniqueIds.size,
+      duplicates: allDeliveries.length + extraDeliveries.length - uniqueIds.size,
+      orderViolations,
+      latencyMs: {
+        min: latencies[0],
+        p50: percentile(latencies, 0.5),
+        p95: percentile(latencies, 0.95),
+        p99: percentile(latencies, 0.99),
+        max: latencies.at(-1),
+```
+
+场景断言同时观察协议响应和对端实际结果：仅有发送成功或 ACK 并不足以证明消息送达。数量、字段、错误码或“观察窗口内没有额外消息”共同限定了本片段要验证的系统性质。
+
+### 片段 6：第 137-143 行
+
+```javascript
+      },
+    },
+  }, null, 2));
+} finally {
+  // 无论断言在哪一步失败，都主动关闭 WebSocket，避免压测连接悬挂影响下一轮测试。
+  for (const client of clients) client.close();
+}
+```
+
+`finally` 会遍历本轮登记的客户端并关闭连接。即使中途断言抛错，服务端也能触发断线清理，避免残留在线路由让下一轮重复登录或离线场景得到假结果。
 
 ## 面试重点
 
-重要性最高。常见问题：p95/p99 比平均值有何价值、吞吐计算包含什么、不包含注册登录的原因、压测客户端是否可能成为瓶颈、为什么必须同时检查正确性而不只看 QPS。结果只能代表当前机器与参数，应配合 CPU/内存/网络/数据库指标定位瓶颈。
+- 能否沿着一条单聊消息说明本地直发、跨节点路由、离线落库、ACK 与重试之间的成功语义？
+
+- Redis 或 RabbitMQ 故障时系统如何降级，哪些保证仍成立，哪些保证会变弱？
+
+- 为什么“至少一次发送 + message_id 幂等”不等于严格 Exactly Once？

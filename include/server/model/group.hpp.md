@@ -2,47 +2,71 @@
 
 ## 作用概览
 
-`Group` 是群组数据对象，保存群 ID、名称、描述和成员列表，用于 Model 查询结果与登录响应之间传递数据。
+**群组领域对象。** 把群基本信息和成员列表放在一个对象中，供登录响应一次返回用户已加入的群及成员状态。
 
-## 按学习顺序讲解
+阅读位置：`include/server/model/group.hpp`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-- `Group(id,name,desc)`：用默认值或给定值初始化三个基本字段。
-- `setId/setName/setDesc`：分别修改 ID、名称和描述。
-- `getId/getName/getDesc`：分别读取三个字段。
-- `getUsers()`：返回成员向量的可变引用，Model 可直接向其中追加 `GroupUser`。
+## 代码片段与详细讲解
 
-## 函数详细说明
+### 片段 1：第 1-25 行
 
-### `Group(id, name, desc)`
+```cpp
+#ifndef GROUP_H
+#define GROUP_H
 
-构造函数用于创建一个群对象，既可以接收数据库查询出来的真实字段，也可以使用默认参数构造一个空对象。默认值让模型层在声明局部变量、等待 SQL 查询结果回填时更方便。
+#include "groupuser.hpp"
+#include <string>
+#include <vector>
+using namespace std;
 
-`id` 对应群表主键，`name` 是群名称，`desc` 是群描述。创建群时，`id` 通常先是 `-1`，等 `GroupModel::createGroup` 插入数据库后再用自增 ID 回填。
+// Group 表的轻量数据对象，同时聚合群成员列表。
+// 单独群信息来自 allgroup，成员信息由 groupuser + user 联表查询后填入 users。
+class Group
+{
+public:
+    // id=-1 表示尚未入库或查询失败；createGroup 成功后 Model 会回填数据库自增 id。
+    Group(int id = -1, string name = "", string desc = "")
+    {
+        this->id = id;
+        this->name = name;
+        this->desc = desc;
+    }
 
-### `setId(id)` / `getId()`
+    // setter 供 Model 层组装查询结果，业务层通常只读取这些字段。
+    void setId(int id) { this->id = id; }
+    void setName(string name) { this->name = name; }
+    void setDesc(string desc) { this->desc = desc; }
+```
 
-`setId` 用于修改群 ID，典型场景是创建群后把数据库生成的 `LAST_INSERT_ID()` 写回对象。`getId` 用于业务层读取群 ID，例如创建群成功后把创建者加入这个群，或客户端展示群列表。
+`Group` 是在数据库模型与业务层之间传递的值对象。setter 在查询后逐字段组装对象，getter 在登录响应序列化时读取；对象本身不执行 SQL，也不判断登录或群权限，从而保持职责单一。
 
-这里的重点不是算法，而是对象生命周期：创建前 ID 未确定，创建成功后 ID 才能作为后续 `GroupUser` 关系的外键使用。
+### 片段 2：第 26-43 行
 
-### `setName(name)` / `getName()`
+```cpp
 
-这组函数负责群名称读写。`setName` 常用于组装对象或以后扩展“修改群资料”接口；`getName` 在登录响应、群列表展示、调试日志中会用到。
+    // getUsers 返回引用是为了让 GroupModel 在查询成员时直接 push_back，
+    // 避免每次修改成员列表都复制整个 vector。
+    int getId() { return this->id; }
+    string getName() { return this->name; }
+    string getDesc() { return this->desc; }
+    vector<GroupUser> &getUsers() { return this->users; }
 
-当前 getter 返回字符串副本，调用简单但会产生一次拷贝。项目规模不大时可以接受；如果追求接口规范，可以改成 `const string& getName() const`。
+private:
+    // 对应 allgroup 表的 id/groupname/groupdesc 字段。
+    int id;
+    string name;
+    string desc;
+    // 查询用户所在群组时携带成员列表，便于登录响应一次返回群和成员关系。
+    vector<GroupUser> users;
+};
 
-### `setDesc(desc)` / `getDesc()`
+#endif
+```
 
-这组函数负责群描述字段读写。群描述不是核心路由字段，但能提高前端展示信息完整度，也能说明 `Group` 对象不只是群 ID，而是用于承载完整群资料。
-
-和群名称一样，返回副本更简单，返回常量引用更节省拷贝。
-
-### `getUsers()`
-
-`getUsers` 返回群成员列表的可变引用，`GroupModel::queryGroups` 查询到每个群的成员后，会直接通过这个引用向 `_users` 里追加 `GroupUser`。
-
-这个设计的优点是代码短，模型层组装嵌套对象很方便；缺点是封装性弱，外部调用者可以任意修改内部 vector。面试时如果被问到，可以说当前为了简洁采用可变引用，后续可以增加 `addUser(const GroupUser&)` 和只读 getter，让对象边界更清楚。
+这里固定模块需要长期保存的状态。这些成员把跨回调信息留在对象生命周期内；实现文件中的锁和清理逻辑必须围绕它们保持一致。
 
 ## 面试重点
 
-重要性较低。若被问到，可说明它是简单 DTO/ORM 对象；`getUsers` 暴露可变引用虽然方便，但封装性较弱，可改为 `addUser` 和只读访问器。
+- 这个文件处于哪一层，它保存的数据由谁创建、由谁消费？
+
+- 如果删除或修改本文件，最先受影响的运行链路是什么？

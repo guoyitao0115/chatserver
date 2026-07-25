@@ -2,101 +2,334 @@
 
 ## 作用概览
 
-这是所有 Web 端到端、可靠性和压力测试共用的原生 WebSocket 测试客户端。它不依赖浏览器或第三方库，直接用 TCP 完成握手与帧协议，因此能精确控制消息、超时和重复检测。
+**端到端测试客户端。** 不用第三方 WebSocket 库，直接构造握手和帧，提供带谓词的等待、批量收集、无消息断言、注册与登录助手。可靠性和负载测试共享它以避免各自实现不同的接收语义。
 
-## 按学习顺序讲解
+阅读位置：`web/test/e2e-client.mjs`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-- `encodeClientFrame(value,opcode)`：序列化文本，生成随机 4 字节 mask，支持三种长度并按 RFC 要求对客户端 payload 掩码；也可生成 close 帧。
-- `parseFrames(buffer,onMessage)`：增量解析服务端无 mask 帧，只处理文本 opcode，并给消息附加不可枚举接收时间用于延迟统计。
-- `createClient(port,options)`：建立 TCP，发送 HTTP Upgrade，缓存握手和后续帧。内部 `removeWaiter` 删除超时观察者，`deliver` 优先满足谓词 waiter，否则进入消息队列。
-- 返回 API 的 `send`/ `sendRawText`：发送对象或故意损坏的原始文本。
-- `waitFor(predicate,timeout)`：先查已缓存消息，再注册带超时的 waiter。
-- `collect(predicate,count,timeout)`：在总截止时间内收集指定数量。
-- `drain(predicate)`：同步取走已缓存的匹配消息，用于检查延迟重复。
-- `expectNoMessage(predicate,duration)`：在窗口内若出现匹配消息就失败，是去重测试的关键负断言。
-- `close()`：发送标准 close 帧并结束 socket，使网关及时关闭后端连接。
-- `register(...)`、`login(...)`：封装常用请求等待。
-- `parseEmbedded(values)`：解析登录响应中的嵌套 JSON 字符串。
-- `delay(milliseconds)`：Promise 版计时器。
+## 代码片段与详细讲解
 
-## 函数详细说明
+### 片段 1：第 1-24 行
 
-### `encodeClientFrame(value, opcode = 0x1)`
+```javascript
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import net from 'node:net';
 
-函数把对象 JSON 序列化，或直接接受原始字符串，再转为 UTF-8 Buffer。它根据正文长度选择 WebSocket 的 7 位、16 位或 64 位长度格式，设置 FIN 和 opcode，并生成 4 字节随机 mask。正文每个字节与循环 mask 异或后和头部拼接。
+// 端到端测试专用的最小 WebSocket 客户端。它刻意基于 net 手写握手和帧解析，
+// 从而不依赖第三方 WebSocket 库，并能真实覆盖网关的掩码、半包、粘包处理。
 
-客户端到服务端的帧必须带 mask，因此测试客户端若省略这一步，合规网关应拒绝。opcode 参数还允许 `close()` 生成关闭帧；测试正文通常使用文本 opcode `0x1`。
+// 与生产协议一致的消息编号，供可靠性、压测和故障注入脚本共享。
+export const MSG = Object.freeze({
+  LOGIN: 1,
+  LOGIN_ACK: 2,
+  LOGOUT: 3,
+  REGISTER: 4,
+  REGISTER_ACK: 5,
+  ONE_CHAT: 6,
+  ADD_FRIEND: 7,
+  CREATE_GROUP: 8,
+  ADD_GROUP: 9,
+  GROUP_CHAT: 10,
+  ACK: 11,
+  HEARTBEAT: 12,
+  HEARTBEAT_ACK: 13,
+  ERROR: 14,
+});
+```
 
-### `parseFrames(buffer, onMessage)`
+这些依赖明确了本片段所在层的边界：密码或随机数、断言框架、TCP socket。项目内部头文件提供协议和领域对象，外部库只承担基础能力；业务数据如何流转仍由当前模块决定。
 
-解析器从 offset 0 开始循环，只在基础头、扩展长度和完整正文都已到达时消费一帧；不足部分原样返回，等待下一次 socket data 拼接。服务端帧不带 mask，因此这里直接读取正文。文本帧被 JSON.parse 后交给回调，其他 opcode 被跳过。
+### 片段 2：第 25-46 行
 
-函数给消息添加不可枚举 `__receivedAt`。它可用于端到端延迟计算，但 `JSON.stringify`、深比较和业务字段遍历不会把这个测试元数据当成协议内容。
+```javascript
 
-### `createClient(port, options = {})`
+function encodeClientFrame(value, opcode = 0x1) {
+  // 浏览器到服务端的 WebSocket 帧必须携带随机 4 字节掩码；测试客户端遵守同一规则。
+  const body = Buffer.from(typeof value === 'string' ? value : JSON.stringify(value));
+  const mask = crypto.randomBytes(4);
+  let header;
+  // 覆盖 WebSocket 的 7 位、16 位和 64 位长度格式，长消息测试不会被测试工具本身截断。
+  if (body.length < 126) {
+    header = Buffer.allocUnsafe(6);
+    header[1] = 0x80 | body.length;
+    mask.copy(header, 2);
+  } else if (body.length <= 0xffff) {
+    header = Buffer.allocUnsafe(8);
+    header[1] = 0x80 | 126;
+    header.writeUInt16BE(body.length, 2);
+    mask.copy(header, 4);
+  } else {
+    header = Buffer.allocUnsafe(14);
+    header[1] = 0x80 | 127;
+    header.writeBigUInt64BE(BigInt(body.length), 2);
+    mask.copy(header, 10);
+  }
+```
 
-该异步工厂选择 host 和默认超时，建立原生 TCP 连接，关闭 Nagle 延迟，并手工发送 HTTP Upgrade 请求。它分开保存握手缓冲和 WebSocket 帧缓冲：先查找 `\r\n\r\n` 并断言状态行为 101，握手后剩余的字节立即作为第一批帧解析，避免响应头和首帧同包时丢数据。
+这部分属于“端到端测试客户端”的状态衔接代码。它只推进当前事件已经确认的结果；异步响应、未匹配消息或未完成缓冲仍保存在本模块中，后续事件到达后继续处理，不会被当作空结果丢弃。
 
-工厂等待 upgraded 标志后才返回 API，调用方因此不会在握手完成前发送业务帧。握手设有截止时间和 error 监听，网关不可达时测试会明确失败，而不是永久挂起。
+### 片段 3：第 47-68 行
 
-### 内部 `removeWaiter(waiter)`
+```javascript
+  header[0] = 0x80 | opcode;
+  const masked = Buffer.from(body);
+  for (let i = 0; i < masked.length; i += 1) masked[i] ^= mask[i % 4];
+  return Buffer.concat([header, masked]);
+}
 
-从等待者数组中定位并删除指定对象，主要在超时和负断言结束时使用。若不删除，过期谓词以后可能截获一条本应交给新请求的消息，还会造成数组持续增长。
+function parseFrames(buffer, onMessage) {
+  // 服务端帧不掩码。函数按增量方式解析完整帧并返回残留半帧，以适应 TCP 任意切包。
+  let offset = 0;
+  while (buffer.length - offset >= 2) {
+    const opcode = buffer[offset] & 0x0f;
+    let length = buffer[offset + 1] & 0x7f;
+    let header = 2;
+    if (length === 126) {
+      if (buffer.length - offset < 4) break;
+      length = buffer.readUInt16BE(offset + 2);
+      header = 4;
+    } else if (length === 127) {
+      if (buffer.length - offset < 10) break;
+      length = Number(buffer.readBigUInt64BE(offset + 2));
+      header = 10;
+    }
+```
 
-### 内部 `deliver(message)`
+循环每次只消费已经确认完整的字节或已经成功写出的部分。遇到正文尚未到齐便停在当前偏移，下一次收到数据后继续；发送短写则从剩余位置续发，这正是流式 socket 不能假设“一次调用完成一条消息”的原因。
 
-每条解析后的消息先在 waiters 中寻找第一个谓词匹配者。找到后删除 waiter、清除其定时器并 resolve；没有观察者时把消息存入缓存队列。这个“观察者优先、否则缓存”的模型同时处理响应早到和等待先注册两种时序。
+### 片段 4：第 69-95 行
 
-不同并发请求的谓词必须足够精确，通常同时匹配 `msgid` 和 `message_id`。只匹配 ACK 类型可能让一个请求拿走另一个请求的 ACK。
+```javascript
+    if (buffer.length - offset < header + length) break;
+    if (opcode === 0x1) {
+      const message = JSON.parse(buffer.subarray(offset + header, offset + header + length).toString());
+      // 收包时间用于端到端延迟统计；设为不可枚举，避免污染深比较和重新序列化结果。
+      Object.defineProperty(message, '__receivedAt', { value: Date.now(), enumerable: false });
+      onMessage(message);
+    }
+    offset += header + length;
+  }
+  return buffer.subarray(offset);
+}
 
-### socket `data` 与 `close` 回调
+export async function createClient(port, options = {}) {
+  // host/timeout 可从参数覆盖，便于同一工具连接本地或容器中的一个/多个网关节点。
+  const host = options.host ?? process.env.CHAT_E2E_HOST ?? '127.0.0.1';
+  const defaultTimeoutMs = options.timeoutMs ?? 15_000;
+  const socket = net.createConnection({ host, port });
+  socket.setNoDelay(true);
+  const key = crypto.randomBytes(16).toString('base64');
+  let upgraded = false;
+  let closed = false;
+  let raw = Buffer.alloc(0);
+  let frames = Buffer.alloc(0);
+  // messages 缓存先到达但暂时无人等待的消息；waiters 保存按谓词等待的异步断言。
+  // 这种设计允许 ACK、业务消息交错到达，而无需假设全局响应顺序。
+  const messages = [];
+  const waiters = [];
+```
 
-data 回调负责增量握手和帧解析，所有完整消息最终进入 deliver。close 回调设置关闭标志，取出全部未完成 waiter、清 timer 并 reject，确保等待中的测试立即知道连接断开，而不是等到各自超时。
+测试客户端把未被当前等待条件消费的消息留在 backlog，并给每个 waiter 保存谓词和超时。先检查积压再注册等待，可覆盖“响应早于 waitFor 调用”的竞态；collect 收满指定数量，expectNoMessage 则在观察窗口内专门捕获重复。
 
-### API `send(value)` 与 `sendRawText(value)`
+本片段读取 `CHAT_E2E_HOST`。未设置时采用紧邻的本机默认值；容器部署则覆盖这些值，因此同一二进制可以作为不同节点运行，无需重新编译。
 
-`send` 在连接关闭时主动抛错，否则编码并写入 TCP；`sendRawText` 要求参数必须是字符串，再复用 send。后者用于发送语法损坏或字段不合法的 JSON 文本，验证网关和后端的错误处理，而普通对象路径会自动序列化为合法 JSON。
+### 片段 5：第 96-127 行
 
-### API `waitFor(predicate, timeoutMs)`
+```javascript
 
-函数先同步搜索已缓存消息，找到就移除并立即返回 Promise；否则创建 waiter，设置谓词、resolve/reject 与超时器。超时时先调用 removeWaiter，再抛出包含端口和等待时长的错误，便于判断是哪条链路未响应。
+  const removeWaiter = (waiter) => {
+    // 超时或“应当无消息”成功后必须移除 waiter，防止后续消息触发已经结束的 Promise。
+    const index = waiters.indexOf(waiter);
+    if (index >= 0) waiters.splice(index, 1);
+  };
 
-“先查缓存再注册”防止响应比测试代码调用 `waitFor` 更快；谓词机制让多个消息类型和多个并发 ID 可以共享同一连接。
+  const deliver = (message) => {
+    // 将消息交给第一个匹配谓词的等待者；没有匹配者时先缓存，避免先到消息丢失。
+    const index = waiters.findIndex((waiter) => waiter.predicate(message));
+    if (index >= 0) {
+      const waiter = waiters.splice(index, 1)[0];
+      clearTimeout(waiter.timer);
+      waiter.resolve(message);
+    } else {
+      messages.push(message);
+    }
+  };
 
-### API `collect(predicate, count, timeoutMs)`
+  socket.on('data', (chunk) => {
+    if (!upgraded) {
+      // HTTP 握手头也可能分多次到达；以 CRLF CRLF 作为完整头部边界。
+      raw = Buffer.concat([raw, chunk]);
+      const marker = raw.indexOf('\r\n\r\n');
+      if (marker < 0) return;
+      assert.match(raw.subarray(0, marker).toString(), /^HTTP\/1\.1 101/);
+      upgraded = true;
+      // 同一 TCP 包中可能紧跟首个 WebSocket 帧，必须保留头部后的所有字节。
+      frames = raw.subarray(marker + 4);
+    } else {
+      frames = Buffer.concat([frames, chunk]);
+    }
+```
 
-该函数在统一总截止时间内反复 `waitFor`，直到收集到指定数量。每轮传入的是剩余时间，而不是重新获得完整 timeout，所以少一条消息时用例会在预期总时限失败，不会因逐条等待被放大为 `count × timeout`。
+接收消息可能早于测试开始等待，所以代码先尝试匹配已有等待器，未命中的消息进入积压队列。删除等待器时同时清理超时器；按谓词而不是 FIFO 匹配，允许 ACK、投递和心跳响应交错到达而不串场。
 
-### API `drain(predicate)`
+### 片段 6：第 128-158 行
 
-函数从后向前遍历缓存，移除全部匹配消息，再用 unshift 保持原到达顺序返回。倒序删除可避免数组 splice 后下标前移导致漏检。它适合在主要收集结束后检查是否已有额外重复消息积压。
+```javascript
+    frames = parseFrames(frames, deliver);
+  });
 
-### API `expectNoMessage(predicate, durationMs)`
+  socket.on('close', () => {
+    // 连接关闭时一次性拒绝所有等待者，避免测试只能等到各自超时才失败。
+    closed = true;
+    for (const waiter of waiters.splice(0)) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error(`connection closed on port ${port}`));
+    }
+  });
 
-负断言先检查缓存中是否已经存在匹配项，有则立即失败；否则注册一个特殊 waiter，在观察窗口内一旦匹配消息到达就 reject，计时结束仍未收到才 resolve。只检查当前队列无法证明之后不会迟到，因此必须保留一个有界观察窗口。
+  await new Promise((resolve, reject) => {
+    // 手写 RFC 6455 Upgrade 请求，以便端到端覆盖网关握手实现。
+    socket.once('connect', () => socket.write([
+      'GET /ws HTTP/1.1',
+      `Host: ${host}:${port}`,
+      'Upgrade: websocket',
+      'Connection: Upgrade',
+      `Sec-WebSocket-Key: ${key}`,
+      'Sec-WebSocket-Version: 13',
+      '\r\n',
+    ].join('\r\n')));
+    const deadline = setTimeout(() => reject(new Error(`handshake timeout on ${port}`)), defaultTimeoutMs);
+    // data 回调负责设置 upgraded；这里轮询仅用于把事件状态转换为 awaitable Promise。
+    const poll = setInterval(() => {
+      if (upgraded) {
+        clearInterval(poll);
+        clearTimeout(deadline);
+        resolve();
+      }
+```
 
-该函数证明的是“给定 duration 内未观察到”，窗口外的极晚重复仍可能发生。测试应按重试/网络最大预期延迟设置合理时长。
+接收消息可能早于测试开始等待，所以代码先尝试匹配已有等待器，未命中的消息进入积压队列。删除等待器时同时清理超时器；按谓词而不是 FIFO 匹配，允许 ACK、投递和心跳响应交错到达而不串场。 退出登录或连接关闭时同时清除心跳和重试定时器，避免旧用户 id 继续续租路由或重发上一会话消息。
 
-### API `close()`
+### 片段 7：第 159-194 行
 
-连接仍存活时编码标准 opcode `0x8` close 帧，并通过 `socket.end` 发送后结束写侧，让网关及时关闭对应后端 TCP。相比直接 destroy，它更接近浏览器正常关闭行为，也减少服务端清理尚未触发就开始下一步测试的竞态。
+```javascript
+    }, 10);
+    socket.once('error', reject);
+  });
 
-### `register(client, name, password, timeoutMs)`
+  const api = {
+    port,
+    send(value) {
+      // 对象默认 JSON 序列化；sendRawText 可发送故意损坏或字段缺失的原始文本。
+      if (closed) throw new Error(`cannot send on closed connection ${port}`);
+      socket.write(encodeClientFrame(value));
+    },
+    sendRawText(value) {
+      if (typeof value !== 'string') throw new TypeError('raw WebSocket payload must be a string');
+      api.send(value);
+    },
+    waitFor(predicate, timeoutMs = defaultTimeoutMs) {
+      // 先检索历史缓存，解决“消息到达早于 waitFor 注册”的竞态。
+      const index = messages.findIndex(predicate);
+      if (index >= 0) return Promise.resolve(messages.splice(index, 1)[0]);
+      return new Promise((resolve, reject) => {
+        const waiter = { predicate, resolve, reject, timer: null };
+        waiter.timer = setTimeout(() => {
+          removeWaiter(waiter);
+          reject(new Error(`message timeout on port ${port} after ${timeoutMs}ms`));
+        }, timeoutMs);
+        waiters.push(waiter);
+      });
+    },
+    async collect(predicate, count, timeoutMs = defaultTimeoutMs) {
+      // 多消息收集共享一个总截止时间，而不是让每一条消息都重新获得完整 timeout。
+      const deadline = Date.now() + timeoutMs;
+      const collected = [];
+      while (collected.length < count) {
+        const remaining = Math.max(1, deadline - Date.now());
+        collected.push(await api.waitFor(predicate, remaining));
+      }
+```
 
-封装注册请求和响应等待，谓词只接受 `REGISTER_ACK`。收到后断言 `errno === 0`，失败信息包含用户名与服务端错误，成功返回分配的用户 ID。场景脚本因此可以聚焦业务性质，不必重复样板断言。
+接收消息可能早于测试开始等待，所以代码先尝试匹配已有等待器，未命中的消息进入积压队列。删除等待器时同时清理超时器；按谓词而不是 FIFO 匹配，允许 ACK、投递和心跳响应交错到达而不串场。 发送前创建 UUID、递增当前会话序号并立即插入本地消息；随后登记 pending 和发送 payload，用户能即时看到“发送中”，ACK 再更新为已发送。
 
-### `login(client, id, password, timeoutMs)`
+### 片段 8：第 195-227 行
 
-发送登录请求并等待 `LOGIN_ACK`，但不直接断言成功，因为可靠性测试需要观察重复登录失败等合法负路径。调用者根据场景检查 `errno`，并解析离线消息或好友群组字段。
+```javascript
+      return collected;
+    },
+    drain(predicate) {
+      // 压测完成后排出迟到的匹配消息，用于检测预期数量之外的重复投递。
+      const drained = [];
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        if (predicate(messages[i])) drained.unshift(...messages.splice(i, 1));
+      }
+      return drained;
+    },
+    async expectNoMessage(predicate, durationMs = 500) {
+      // 负向断言同时检查既有缓存和未来时间窗口，专门验证“去重后不再投递”。
+      const existing = messages.find(predicate);
+      if (existing) throw new Error(`unexpected duplicate message on port ${port}`);
+      await new Promise((resolve, reject) => {
+        const waiter = {
+          predicate,
+          resolve(message) { reject(new Error(`unexpected message: ${JSON.stringify(message)}`)); },
+          reject,
+          timer: null,
+        };
+        waiter.timer = setTimeout(() => {
+          removeWaiter(waiter);
+          resolve();
+        }, durationMs);
+        waiters.push(waiter);
+      });
+    },
+    close() {
+      if (!closed && !socket.destroyed) {
+        // 发送标准 WebSocket Close 帧并等待底层写缓冲刷出，确保网关立即关闭后端 TCP。
+        socket.end(encodeClientFrame('', 0x8));
+      }
+```
 
-### `parseEmbedded(values = [])`
+循环遍历 `messages`，把每个元素独立转换、投递或校验。结果按遍历顺序追加，某个元素失败时由本片段的状态变量或断言记录，不能用一次总体成功掩盖单项失败。
 
-逐项把服务端返回的 JSON 字符串解析成对象，已经是对象的值原样保留。它封装旧接口的双重 JSON 编码，便于离线消息、好友和群组断言访问真实字段。
+### 片段 9：第 228-253 行
 
-### `delay(milliseconds)`
+```javascript
+    },
+  };
+  return api;
+}
 
-用 `setTimeout` 包装 Promise，供测试明确等待断线清理、故障注入窗口或负观察期。固定 delay 容易受慢机器影响，应只用于没有可观察事件可等待的场合；能等待 ACK、健康状态或进程输出时优先事件驱动条件。
+export async function register(client, name, password, timeoutMs = 30_000) {
+  // 注册辅助函数直接断言成功并返回新 ID，让测试场景把注意力放在后续可靠性行为上。
+  client.send({ msgid: MSG.REGISTER, name, password });
+  const response = await client.waitFor((message) => message.msgid === MSG.REGISTER_ACK, timeoutMs);
+  assert.equal(response.errno, 0, `register failed for ${name}: ${response.errmsg ?? 'unknown'}`);
+  return response.id;
+}
+
+export async function login(client, id, password, timeoutMs = 30_000) {
+  // 登录可能被场景故意期待失败（例如并发登录），因此这里返回响应而不强制 errno=0。
+  client.send({ msgid: MSG.LOGIN, id, password });
+  return client.waitFor((message) => message.msgid === MSG.LOGIN_ACK, timeoutMs);
+}
+
+export function parseEmbedded(values = []) {
+  // 与后端当前登录响应兼容：关系和离线消息可能以 JSON 字符串形式嵌在数组中。
+  return values.map((value) => (typeof value === 'string' ? JSON.parse(value) : value));
+}
+
+// 统一的可 await 延迟，用于等待退出路由传播或人工故障注入窗口。
+export const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+```
+
+场景断言同时观察协议响应和对端实际结果：仅有发送成功或 ACK 并不足以证明消息送达。数量、字段、错误码或“观察窗口内没有额外消息”共同限定了本片段要验证的系统性质。
 
 ## 面试重点
 
-重要性高。可能问题：为什么测试客户端要实现 waiter 队列、如何证明“没有重复消息”、为什么延迟时间属性设为不可枚举、WebSocket 客户端为何必须 mask。该工具是压力与可靠性结论可信度的基础。
+- 测试准备了什么外部状态或模拟组件，实际动作经过哪些模块？
+
+- 每个断言证明的是返回值正确，还是“不丢、不重、不乱序、不可冒用”等系统性质？
+
+- 如何避免测试自身的等待竞态和上轮残留状态造成假失败？

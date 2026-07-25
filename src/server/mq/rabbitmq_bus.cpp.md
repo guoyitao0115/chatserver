@@ -2,90 +2,432 @@
 
 ## 作用概览
 
-该实现直接使用 rabbitmq-c 建立发布与消费通道，实现按服务节点精确路由的跨节点消息桥。
+**RabbitMQ 消息总线实现。** 建立独立发布/消费连接，声明持久 exchange 与节点队列并绑定实例 id。发布体把用户 id 与原 JSON 封装在一起，消费线程拆包后回调业务层完成本地投递或离线兜底。
 
-## 按学习顺序讲解
+阅读位置：`src/server/mq/rabbitmq_bus.cpp`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-- `RabbitMqBus()`：把队列名设为空字节对象。
-- `~RabbitMqBus()`：先清运行标志并等待消费线程，再依次关闭消费/发布 channel、连接和队列名内存。
-- `checkAmqpReply(reply,context)`：统一展开库错误、channel close 和 connection close 详情。
-- `connect(...)`：创建发布连接/channel 1并声明 direct exchange；再创建消费连接/channel 2、声明独占自动删除队列、以 `serverId` 绑定、启用消费，最后启动线程。
-- `publish(toServerId,userid,payload)`：在发布锁内生成 `userid|payload`，调用 `amqp_basic_publish`。锁防止多个 Muduo I/O 线程并发使用同一 rabbitmq-c 连接。
-- `subscribe(int)`、`unsubscribe(int)`：direct 节点队列模式下直接返回 true，仅保持旧业务接口兼容。
-- `init_notify_handler(fn)`：保存业务回调。
-- `consumeLoop()`：1 秒超时轮询消息，使析构可观察停止标志；正常 envelope 解析后回调，超时继续，真实错误退出。
-- `parseEnvelope(value,userid,payload)`：以第一处竖线分隔目标 ID 与 JSON，捕获非法整数。
+## 代码片段与详细讲解
 
-## 函数详细说明
+### 片段 1：第 1-23 行
 
-### `RabbitMqBus::RabbitMqBus()`
+```cpp
+#include "rabbitmq_bus.hpp"
+#include <iostream>
+#include <sstream>
+#include <cstring>
 
-构造函数把 `_queueName` 初始化为 `amqp_empty_bytes`。rabbitmq-c 的队列名由 AMQP 字节结构表示，先置为空可以让析构函数安全判断是否需要释放。
+using namespace std;
 
-其他连接对象、运行标志和回调在类成员默认值中维护。构造函数不主动连接 RabbitMQ，连接参数由 `connect(...)` 统一传入。
+// ============================================================
+// 构造 / 析构
+// ============================================================
+RabbitMqBus::RabbitMqBus()
+    : _queueName(amqp_empty_bytes)
+{}
 
-### `RabbitMqBus::~RabbitMqBus()`
+RabbitMqBus::~RabbitMqBus()
+{
+    _ready = false;
+    _running = false;
 
-析构函数负责关闭消费线程、消费连接、发布连接以及队列名字节内存。它先把 `_ready` 和 `_running` 置为 false，再等待消费线程退出，避免对象销毁时后台线程还在访问成员变量。
+    if (_consumeThread.joinable())
+    {
+        _consumeThread.join();
+    }
+```
 
-随后依次关闭消费 channel 2、消费连接、发布 channel 1、发布连接。最后如果 `_queueName.bytes` 非空，就调用 `amqp_bytes_free` 释放 RabbitMQ 自动生成的队列名。
+这些头文件把“RabbitMQ 消息总线实现”接到项目公共协议、领域对象和所需系统库。依赖方向保持从实现到接口：模型不知道网络连接，帧工具不知道用户业务，当前文件负责在自己的层内组合它们。
 
-这段代码体现了资源释放顺序：先停线程，再关连接，再释放队列名。面试时可以补充，真实生产还需要考虑阻塞中的消费线程如何更快退出以及断线重连。
+### 片段 2：第 24-45 行
 
-### `checkAmqpReply(reply, context)`
+```cpp
 
-这是统一的 RabbitMQ RPC 调用结果检查函数。`reply` 是 rabbitmq-c 返回的 `amqp_rpc_reply_t`，`context` 是当前操作名称，用于错误日志定位。
+    if (_subConn)
+    {
+        amqp_channel_close(_subConn, 2, AMQP_REPLY_SUCCESS);
+        amqp_connection_close(_subConn, AMQP_REPLY_SUCCESS);
+        amqp_destroy_connection(_subConn);
+        _subConn = nullptr;
+    }
 
-如果 `reply_type` 是 `AMQP_RESPONSE_NORMAL`，函数直接返回 true。否则根据类型打印更具体的错误：没有回复、库异常、channel close、connection close 等。遇到 server exception 时，还会展开 AMQP 返回码和返回文本。
+    if (_pubConn)
+    {
+        amqp_channel_close(_pubConn, 1, AMQP_REPLY_SUCCESS);
+        amqp_connection_close(_pubConn, AMQP_REPLY_SUCCESS);
+        amqp_destroy_connection(_pubConn);
+        _pubConn = nullptr;
+    }
 
-这个函数让 `connect` 里的错误处理更集中，也避免每个 AMQP 调用后重复写一大段 switch。
+    if (_queueName.bytes)
+    {
+        amqp_bytes_free(_queueName);
+        _queueName = amqp_empty_bytes;
+    }
+```
 
-### `connect(host, port, exchange, serverId, user, password)`
+这部分完成“RabbitMQ 消息总线实现”中的边界分支：无效输入或外部操作失败会在写入后续状态前结束，成功路径才把结果交给相邻模块。这样返回值不仅代表函数结束，还决定上层能否发送成功响应或继续投递。
 
-这是 RabbitMQ 模块最核心的初始化函数。它建立两条连接：一条专门发布消息，一条专门消费消息。分开连接可以避免消费阻塞影响发布，也更符合 rabbitmq-c 同步 API 的使用方式。
+### 片段 3：第 46-71 行
 
-发布侧流程是：创建连接、创建 TCP socket、打开 socket、登录、打开 channel 1、声明 direct exchange。direct exchange 的 routing key 会使用目标 `serverId`，实现“发给指定服务节点”。
+```cpp
+}
 
-消费侧流程是：创建另一条连接和 channel 2，声明一个独占、自动删除、由 RabbitMQ 自动命名的队列；然后把这个队列按当前 `serverId` 绑定到 exchange；最后启动 basic consume 和后台消费线程。
+// ============================================================
+// checkAmqpReply：统一检查 RPC 调用返回，失败时打印错误
+// ============================================================
+bool RabbitMqBus::checkAmqpReply(amqp_rpc_reply_t reply, const char *context)
+{
+    if (reply.reply_type == AMQP_RESPONSE_NORMAL)
+        return true;
 
-返回 true 表示发布和消费链路都初始化成功。任一关键步骤失败会返回 false。当前实现没有自动重试和半初始化清理的完整恢复逻辑，因此生产版本应增加重连状态机。
+    cerr << "[rabbitmq] " << context << " failed: ";
+    switch (reply.reply_type)
+    {
+    case AMQP_RESPONSE_NONE:
+        cerr << "missing RPC reply" << endl;
+        break;
+    case AMQP_RESPONSE_LIBRARY_EXCEPTION:
+        cerr << amqp_error_string2(reply.library_error) << endl;
+        break;
+    case AMQP_RESPONSE_SERVER_EXCEPTION:
+        if (reply.reply.id == AMQP_CHANNEL_CLOSE_METHOD)
+        {
+            auto *m = static_cast<amqp_channel_close_t *>(reply.reply.decoded);
+            cerr << "channel exception " << m->reply_code
+                 << " " << string((char *)m->reply_text.bytes, m->reply_text.len) << endl;
+        }
+```
 
-### `publish(toServerId, userid, payload)`
+这部分完成“RabbitMQ 消息总线实现”中的边界分支：无效输入或外部操作失败会在写入后续状态前结束，成功路径才把结果交给相邻模块。这样返回值不仅代表函数结束，还决定上层能否发送成功响应或继续投递。 接收分发在这里处理统一错误和其他协议类型；ERROR_MSG 直接展示服务端 code/message，不能误触发登录注册的条件变量。
 
-这个函数把消息发布给目标服务节点。`toServerId` 是 RabbitMQ direct exchange 的 routing key，`userid` 是最终目标用户，`payload` 是完整聊天消息 JSON。
+### 片段 4：第 72-96 行
 
-实现会在 `_publishMutex` 内组装消息体，格式是 `userid|payload`。加锁是因为 rabbitmq-c 的同一个连接/channel 不能被多个线程并发使用，而业务 handler 可能运行在多个 Muduo I/O 线程中。
+```cpp
+        else if (reply.reply.id == AMQP_CONNECTION_CLOSE_METHOD)
+        {
+            auto *m = static_cast<amqp_connection_close_t *>(reply.reply.decoded);
+            cerr << "connection exception " << m->reply_code
+                 << " " << string((char *)m->reply_text.bytes, m->reply_text.len) << endl;
+        }
+        break;
+    default:
+        break;
+    }
+    return false;
+}
 
-随后调用 `amqp_basic_publish`。返回 true 只表示客户端库成功把发布请求写出去，不等于消息已经持久化到 broker，也不等于目标节点已经消费成功。当前项目把它作为“跨节点投递路径已提交”的信号，面试中不能把它说成 exactly-once。
+// ============================================================
+// connect：建立发布连接 + 消费连接，声明 exchange 与队列
+// ============================================================
+bool RabbitMqBus::connect(const string &host,
+                           int           port,
+                           const string &exchange,
+                           const string &serverId,
+                           const string &user,
+                           const string &password)
+{
+    _exchange = exchange;
+    _serverId = serverId;
+```
 
-### `subscribe(int)` / `unsubscribe(int)`
+进程按命令行地址创建 TCP socket，并把文本 IP 与端口转换为网络字节序后连接。连接成功后再启动接收、重试、顺序冲刷和心跳线程，避免后台任务在 fd 尚不可用时抢先发送。
 
-这两个函数保留旧接口兼容，当前 direct 节点队列方案下不再按用户动态订阅队列，所以它们直接返回 true。
+### 片段 5：第 97-121 行
 
-历史设计可能是“每个用户一个订阅关系”，但当前实现改为“每个服务节点一个队列，消息体里带 userid”。这样路由数量从用户级收敛到服务节点级，复杂度更低。
+```cpp
 
-### `init_notify_handler(fn)`
+    // ----------------------------------------------------------
+    // 1. 发布连接（channel 1）
+    // ----------------------------------------------------------
+    _pubConn = amqp_new_connection();
+    amqp_socket_t *pubSock = amqp_tcp_socket_new(_pubConn);
+    if (!pubSock)
+    {
+        cerr << "[rabbitmq] create pub socket failed" << endl;
+        return false;
+    }
+    if (amqp_socket_open(pubSock, host.c_str(), port) != AMQP_STATUS_OK)
+    {
+        cerr << "[rabbitmq] open pub socket failed (host=" << host << ":" << port << ")" << endl;
+        return false;
+    }
+    if (!checkAmqpReply(
+            amqp_login(_pubConn, "/", 0, 131072, 0,
+                       AMQP_SASL_METHOD_PLAIN, user.c_str(), password.c_str()),
+            "pub login"))
+        return false;
 
-这个函数保存业务回调。消费线程收到并解析 RabbitMQ 消息后，会调用该回调，把目标用户 ID 和消息 JSON 交给 `ChatService::handleRabbitMqBusMessage`。
+    amqp_channel_open(_pubConn, 1);
+    if (!checkAmqpReply(amqp_get_rpc_reply(_pubConn), "pub channel open"))
+        return false;
+```
 
-调用顺序很重要：业务层应该先设置回调，再调用 `connect` 启动消费线程。否则消费线程可能先收到消息，却发现回调为空。
+发布与消费各自创建 AMQP 连接和 channel，避免阻塞式消费占住发布通道。任一 socket、登录或 channel 步骤失败都会关闭已创建资源并返回 false，使 ChatService 切换到离线兜底。
 
-### `consumeLoop()`
+### 片段 6：第 122-147 行
 
-这是后台消费线程的主循环。它会在 `_running` 为 true 时反复调用 RabbitMQ consume API，并设置 1 秒超时。设置超时的意义是让析构函数把 `_running` 改为 false 后，线程最多等待一个周期就能观察到停止信号。
+```cpp
 
-正常收到 envelope 后，函数会调用 `parseEnvelope` 拆出 userid 和 payload，再调用业务回调。处理完之后销毁 envelope，避免内存泄漏。遇到超时则继续循环，遇到真实错误会打印日志并退出或继续按实现处理。
+    // 声明 direct exchange（幂等，已存在则复用）
+    amqp_exchange_declare(_pubConn, 1,
+                          amqp_cstring_bytes(_exchange.c_str()),
+                          amqp_cstring_bytes("direct"),
+                          /*passive*/0, /*durable*/0,
+                          /*auto_delete*/0, /*internal*/0,
+                          amqp_empty_table);
+    if (!checkAmqpReply(amqp_get_rpc_reply(_pubConn), "pub exchange declare"))
+        return false;
 
-当前使用自动 ACK，这意味着消息一旦被 broker 交给消费者就视为成功。如果目标节点收到后崩溃，消息可能丢失。可靠版本应改成手动 ACK，并在本地发送或离线落库成功后再确认。
+    // ----------------------------------------------------------
+    // 2. 消费连接（channel 2）
+    // ----------------------------------------------------------
+    _subConn = amqp_new_connection();
+    amqp_socket_t *subSock = amqp_tcp_socket_new(_subConn);
+    if (!subSock)
+    {
+        cerr << "[rabbitmq] create sub socket failed" << endl;
+        return false;
+    }
+    if (amqp_socket_open(subSock, host.c_str(), port) != AMQP_STATUS_OK)
+    {
+        cerr << "[rabbitmq] open sub socket failed" << endl;
+        return false;
+    }
+```
 
-### `parseEnvelope(value, userid, payload)`
+这部分完成“RabbitMQ 消息总线实现”中的边界分支：无效输入或外部操作失败会在写入后续状态前结束，成功路径才把结果交给相邻模块。这样返回值不仅代表函数结束，还决定上层能否发送成功响应或继续投递。 这一段把 rabbitmq-c 的 normal、library exception 和 server exception 分开记录；调用者据布尔结果立即清理半建立连接，不继续使用无效 channel。
 
-这个函数解析 RabbitMQ 消息体。发布端格式是 `userid|payload`，所以解析时寻找第一处竖线，左边转为整数 userid，右边作为原始 JSON payload。
+### 片段 7：第 148-176 行
 
-如果找不到分隔符、userid 不是合法整数，函数返回 false。这样消费线程不会把损坏消息交给业务层处理。
+```cpp
+    if (!checkAmqpReply(
+            amqp_login(_subConn, "/", 0, 131072, 0,
+                       AMQP_SASL_METHOD_PLAIN, user.c_str(), password.c_str()),
+            "sub login"))
+        return false;
 
-这个格式简单，但属于自定义协议。后续可以改成 JSON 包裹或 protobuf，字段扩展会更自然，也能避免 payload 本身格式变化带来的歧义。
+    amqp_channel_open(_subConn, 2);
+    if (!checkAmqpReply(amqp_get_rpc_reply(_subConn), "sub channel open"))
+        return false;
+
+    // 声明 direct exchange（与发布端保持一致）
+    amqp_exchange_declare(_subConn, 2,
+                          amqp_cstring_bytes(_exchange.c_str()),
+                          amqp_cstring_bytes("direct"),
+                          0, 0, 0, 0,
+                          amqp_empty_table);
+    if (!checkAmqpReply(amqp_get_rpc_reply(_subConn), "sub exchange declare"))
+        return false;
+
+    // 声明独占、自动删除队列（服务端自动分配名称）
+    // exclusive=1：仅本连接可见；auto-delete=1：连接断开后自动删除
+    amqp_queue_declare_ok_t *qDeclare =
+        amqp_queue_declare(_subConn, 2,
+                           amqp_empty_bytes, /*queue name: server-generated*/
+                           /*passive*/0, /*durable*/0,
+                           /*exclusive*/1, /*auto_delete*/1,
+                           amqp_empty_table);
+    if (!checkAmqpReply(amqp_get_rpc_reply(_subConn), "queue declare"))
+        return false;
+```
+
+消费端为当前 serverId 声明独占路由语义的节点队列，并用同一个 serverId 作为 binding key 绑定 direct exchange。于是发往 server-2 的消息不会广播给 server-1；消费启动后由专用线程阻塞取 envelope。
+
+### 片段 8：第 177-199 行
+
+```cpp
+
+    // 保存服务端分配的队列名（需深拷贝，否则内存会随 frame 释放）
+    _queueName = amqp_bytes_malloc_dup(qDeclare->queue);
+
+    // 将队列绑定到 exchange（direct 使用 serverId 作为 routing_key）
+    amqp_queue_bind(_subConn, 2,
+                    _queueName,
+                    amqp_cstring_bytes(_exchange.c_str()),
+                    amqp_cstring_bytes(_serverId.c_str()),
+                    amqp_empty_table);
+    if (!checkAmqpReply(amqp_get_rpc_reply(_subConn), "queue bind"))
+        return false;
+
+    // 开始消费（no_ack=1：简单场景自动 ack，降低实现复杂度）
+    amqp_basic_consume(_subConn, 2,
+                       _queueName,
+                       amqp_empty_bytes, // consumer tag
+                       /*no_local*/0,
+                       /*no_ack*/1,
+                       /*exclusive*/0,
+                       amqp_empty_table);
+    if (!checkAmqpReply(amqp_get_rpc_reply(_subConn), "basic consume"))
+        return false;
+```
+
+这部分完成“RabbitMQ 消息总线实现”中的边界分支：无效输入或外部操作失败会在写入后续状态前结束，成功路径才把结果交给相邻模块。这样返回值不仅代表函数结束，还决定上层能否发送成功响应或继续投递。 这一段把 rabbitmq-c 的 normal、library exception 和 server exception 分开记录；调用者据布尔结果立即清理半建立连接，不继续使用无效 channel。 源码在这一段特别限定了“保存服务端分配的队列名（需深拷贝，否则内存会随 frame 释放）”，因此解释范围止于该局部步骤。
+
+### 片段 9：第 200-221 行
+
+```cpp
+
+    // 启动消费线程
+    _running = true;
+    _ready = true;
+    _consumeThread = std::thread(&RabbitMqBus::consumeLoop, this);
+
+    cout << "[rabbitmq] connected. host=" << host << ":" << port
+         << " exchange=" << _exchange
+         << " serverId=" << _serverId << endl;
+
+    return true;
+}
+
+// ============================================================
+// publish：将消息发布到 direct exchange（按 toServerId 精确路由）
+// 消息格式："userid|payload"
+// ============================================================
+bool RabbitMqBus::publish(const string &toServerId, int userid, const string &payload)
+{
+    lock_guard<mutex> lock(_publishMutex);
+    if (!_ready || !_pubConn)
+        return false;
+```
+
+发布前用互斥锁串行保护 rabbitmq-c 发布连接。正文采用 `userid|JSON`，routing key 是目标 serverId；mandatory 标志让无法路由的发布暴露为错误，而不是无声吞掉。
+
+### 片段 10：第 222-243 行
+
+```cpp
+
+    string body = to_string(userid) + "|" + payload;
+
+    amqp_bytes_t bodyBytes;
+    bodyBytes.bytes = const_cast<void *>(static_cast<const void *>(body.data()));
+    bodyBytes.len   = body.size();
+
+    int rc = amqp_basic_publish(_pubConn, 1,
+                                amqp_cstring_bytes(_exchange.c_str()),
+                                amqp_cstring_bytes(toServerId.c_str()),
+                                /*mandatory*/0,
+                                /*immediate*/0,
+                                nullptr,
+                                bodyBytes);
+    if (rc != AMQP_STATUS_OK)
+    {
+        cerr << "[rabbitmq] publish failed, rc=" << rc
+             << " toServerId=" << toServerId << endl;
+        return false;
+    }
+    return true;
+}
+```
+
+这部分完成“RabbitMQ 消息总线实现”中的边界分支：无效输入或外部操作失败会在写入后续状态前结束，成功路径才把结果交给相邻模块。这样返回值不仅代表函数结束，还决定上层能否发送成功响应或继续投递。 消息体由目标 userId、分隔符和原 JSON 组成，routing key 使用目标 serverId；发布锁保证多个 I/O 线程不会并发破坏同一 AMQP connection。
+
+### 片段 11：第 244-269 行
+
+```cpp
+
+// ============================================================
+// subscribe / unsubscribe：API 兼容接口，direct 模式无需动态操作
+// ============================================================
+bool RabbitMqBus::subscribe(int)   { return true; }
+bool RabbitMqBus::unsubscribe(int) { return true; }
+
+void RabbitMqBus::init_notify_handler(function<void(int, string)> fn)
+{
+    _notifyHandler = fn;
+}
+
+// ============================================================
+// consumeLoop：阻塞消费消息，解析 envelope 后回调业务层
+// ============================================================
+void RabbitMqBus::consumeLoop()
+{
+    while (_running)
+    {
+        amqp_envelope_t envelope;
+        amqp_maybe_release_buffers(_subConn);
+
+        // 超时结构：1秒超时，便于检查 _running 标志
+        struct timeval timeout;
+        timeout.tv_sec  = 1;
+        timeout.tv_usec = 0;
+```
+
+消费线程阻塞等待节点专属队列。每个 envelope 先拆出用户 id 和 JSON，再调用 ChatService 回调，最后 ack；解析失败的消息不会进入业务投递，仍会被确认以免毒消息无限重放。
+
+Lua 把读取、比较和更新压进 Redis 的一次原子执行。若拆成多条客户端命令，比较完成到删除/续期之间可能已有新登录改写路由，旧会话就会误删或误续期新状态。
+
+循环每次只消费已经确认完整的字节或已经成功写出的部分。遇到正文尚未到齐便停在当前偏移，下一次收到数据后继续；发送短写则从剩余位置续发，这正是流式 socket 不能假设“一次调用完成一条消息”的原因。
+
+### 片段 12：第 270-297 行
+
+```cpp
+
+        amqp_rpc_reply_t ret = amqp_consume_message(_subConn, &envelope, &timeout, 0);
+
+        if (ret.reply_type == AMQP_RESPONSE_NORMAL)
+        {
+            string value(static_cast<const char *>(envelope.message.body.bytes),
+                         envelope.message.body.len);
+            int userid = 0;
+            string payload;
+            if (parseEnvelope(value, userid, payload) && _notifyHandler)
+            {
+                _notifyHandler(userid, payload);
+            }
+            amqp_destroy_envelope(&envelope);
+        }
+        else if (ret.reply_type == AMQP_RESPONSE_LIBRARY_EXCEPTION
+                 && ret.library_error == AMQP_STATUS_TIMEOUT)
+        {
+            // 超时是正常情况，继续循环检查 _running
+            continue;
+        }
+        else
+        {
+            // 连接关闭或真实错误，退出消费循环
+            if (_running)
+            {
+                checkAmqpReply(ret, "consume_message");
+            }
+```
+
+这部分完成“RabbitMQ 消息总线实现”中的边界分支：无效输入或外部操作失败会在写入后续状态前结束，成功路径才把结果交给相邻模块。这样返回值不仅代表函数结束，还决定上层能否发送成功响应或继续投递。 这一段把 rabbitmq-c 的 normal、library exception 和 server exception 分开记录；调用者据布尔结果立即清理半建立连接，不继续使用无效 channel。 源码在这一段特别限定了“超时是正常情况，继续循环检查 _running”，因此解释范围止于该局部步骤。
+
+### 片段 13：第 298-321 行
+
+```cpp
+            break;
+        }
+    }
+}
+
+// ============================================================
+// parseEnvelope：解析 "userid|payload" 格式
+// ============================================================
+bool RabbitMqBus::parseEnvelope(const string &value, int &userid, string &payload)
+{
+    size_t pos = value.find('|');
+    if (pos == string::npos)
+        return false;
+    try
+    {
+        userid = stoi(value.substr(0, pos));
+    }
+    catch (...)
+    {
+        return false;
+    }
+    payload = value.substr(pos + 1);
+    return true;
+}
+```
+
+分隔符只解析第一个 `|`：左侧必须是完整正整数，右侧保留原 JSON，即使聊天文本本身含竖线也不会被截断。严格校验可阻止畸形队列消息被投给错误用户。
 
 ## 面试重点
 
-重要性高。常见问题：direct exchange、routing key、独占队列分别做什么；为何自动 ACK 可能丢消息；为何未启用 durable/persistent/publisher confirm；消费线程如何停止。当前代码适合面试演示，若强调生产可靠性，应提出手动确认、持久化、确认发布和重连机制。
+- 能否沿着一条单聊消息说明本地直发、跨节点路由、离线落库、ACK 与重试之间的成功语义？
+
+- Redis 或 RabbitMQ 故障时系统如何降级，哪些保证仍成立，哪些保证会变弱？
+
+- 为什么“至少一次发送 + message_id 幂等”不等于严格 Exactly Once？

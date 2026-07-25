@@ -2,50 +2,84 @@
 
 ## 作用概览
 
-该文件声明一个最小 MySQL C API RAII 包装类。每个 Model 创建短连接对象，通过它执行更新或查询并获得原生连接用于转义。
+**MySQL 连接封装接口。** 用 RAII 管理单次数据库连接，向模型层提供查询与更新所需的原生句柄，隐藏环境配置和连接释放细节。
 
-## 按学习顺序讲解
+阅读位置：`include/server/db/db.h`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-- `MySQL()`：调用 `mysql_init` 创建连接句柄。
-- `~MySQL()`：关闭非空句柄，避免资源泄漏。
-- `connect()`：从环境变量读取连接参数并建立数据库连接。
-- `update(sql)`：执行 INSERT/UPDATE/DELETE，返回是否成功。
-- `query(sql)`：执行查询并返回 `MYSQL_RES*`，调用方负责 `mysql_free_result`。
-- `getConnection()`：暴露原始连接，供 `mysql_real_escape_string` 等 API 使用。
+## 代码片段与详细讲解
 
-## 函数详细说明
+### 片段 1：第 1-28 行
 
-### `MySQL()` 与 `~MySQL()`
+```cpp
+#ifndef DB_H
+#define DB_H
 
-- 构造函数调用 `mysql_init` 获得 C API 句柄，但此时尚未建立网络连接。
-- 析构函数只在句柄非空时 `mysql_close`，同时释放连接、未完成结果等底层资源，体现最基本的 RAII。
-- 类当前未显式删除拷贝操作；从资源所有权看应补充禁拷贝或安全移动，避免未来误复制导致重复关闭。
+#include <mysql/mysql.h>
+#include <string>
+using namespace std;
 
-### `bool connect()`
+/**
+ * MySQL C API 的轻量 RAII 包装。
+ *
+ * 构造函数只创建本地 MYSQL 句柄，connect() 才建立网络连接；析构函数统一关闭连接。
+ * 当前 Model 层通常为一次业务方法创建一个 MySQL 对象，因此连接和流式结果集不会
+ * 跨线程共享。该类没有显式拷贝控制，也没有内部锁，禁止复制及并发使用同一实例。
+ */
+class MySQL
+{
+public:
+    // 调用 mysql_init 创建句柄；此时尚未读取配置或连接服务器。
+    MySQL();
+    // 关闭 _conn；调用方必须先释放由 query() 返回的全部结果集。
+    ~MySQL();
 
-- **输入**：无显式参数，实际从 `CHAT_MYSQL_*` 环境变量读取地址、端口、用户、密码和库名。
-- **返回**：握手和字符集设置成功返回 true，否则记录数据库错误并返回 false。
-- **调用特征**：Model 通常每个方法创建一个 `MySQL` 局部对象并连接，简单但每次业务都会付出握手成本。
+    /**
+     * 从 CHAT_MYSQL_* 环境变量读取地址、端口、账号和库名并建立连接。
+     * 成功后把连接字符集切换为 utf8mb4，以保存中文和 emoji；失败记录脱敏日志并
+     * 返回 false。后续 update/query/getConnection 只应在成功连接后使用。
+     */
+    bool connect();
+```
 
-### `bool update(string sql)`
+这一组值把部署差异留在环境层：服务进程和 Compose 使用同名键，测试还可临时调大消息数或超时。示例文件只给安全占位和本机默认，不应保存真实生产密码。
 
-- **输入**：完整 SQL 字符串，适用于 INSERT、UPDATE、DELETE。
-- **返回**：`mysql_query` 成功返回 true，失败返回 false；不返回受影响行数。
-- **错误处理**：使用连接上的错误信息记录日志；调用方应根据 bool 决定 ACK 或回滚业务标记。
+### 片段 2：第 29-56 行
 
-### `MYSQL_RES *query(string sql)`
+```cpp
 
-- **输入/返回**：执行 SELECT，成功返回结果集指针，失败返回 nullptr。
-- **所有权**：返回的 `MYSQL_RES*` 由调用者负责 `mysql_free_result`，这是阅读 Model 实现时必须检查的资源点。
-- **实现语义**：当前使用 `mysql_use_result`，读取完成前该连接不能执行下一条查询。
+    /**
+     * 执行 INSERT/UPDATE/DELETE 等不需要结果集的 SQL。
+     * @return mysql_query 返回成功时为 true；失败时只记录 MySQL 错误，不输出完整
+     * SQL，避免密码哈希和聊天内容进入日志。
+     * @note 本函数不负责参数绑定或转义，字符串字段必须由调用方先使用当前连接的
+     * mysql_real_escape_string 处理。
+     */
+    bool update(string sql);
 
-### `MYSQL *getConnection()`
+    /**
+     * 执行 SELECT 并通过 mysql_use_result 返回流式结果集。
+     * @return 成功时返回 MYSQL_RES*，失败为 nullptr。
+     * @ownership 返回指针由调用方拥有，必须完整读取并调用 mysql_free_result；释放
+     * 之前不能在同一连接上执行下一条语句，且结果集不能比 MySQL 对象存活更久。
+     */
+    MYSQL_RES *query(string sql);
 
-- **返回**：非拥有的原生连接指针，生命周期受当前 `MySQL` 对象控制。
-- **用途**：Model 用它调用 `mysql_real_escape_string` 和 `mysql_insert_id`。
-- **边界**：外部不能缓存该指针到 `MySQL` 对象析构之后，也不应自行关闭它。
+    /**
+     * 借用底层句柄，供 Model 执行字符串转义或读取自增主键。
+     * 返回指针不转移所有权、不得缓存或关闭，只在当前 MySQL 对象生命周期内有效。
+     */
+    MYSQL* getConnection();
+private:
+    MYSQL *_conn; // 本对象独占的 C API 连接句柄，由析构函数 mysql_close
+};
 
+#endif
+```
+
+这里固定模块需要长期保存的状态：`_conn`。这些成员把跨回调信息留在对象生命周期内；实现文件中的锁和清理逻辑必须围绕它们保持一致。
 
 ## 面试重点
 
-重要性中等。可能问题：当前封装的不足是什么？每次业务查询新建连接，缺少连接池、预编译语句、事务和错误类型；SQL 注入如何处理？当前字符串字段显式转义，但更推荐 prepared statement。
+- 领域对象与数据访问层如何分工，业务层为什么不直接拼 SQL？
+
+- 当前转义拼接、双向好友写入或群成员 N+1 查询有哪些一致性与性能改进空间？

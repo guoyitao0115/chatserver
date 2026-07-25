@@ -1,211 +1,1215 @@
-# `main.cpp`（客户端）讲解
+# `main.cpp` 讲解
 
 ## 作用概览
 
-这是命令行聊天客户端的完整实现。它建立 TCP 长连接，使用长度帧协议收发 JSON，提供注册/登录/好友/群聊命令，并用 `message_id + ACK + 超时重试 + 客户端序列号` 改善消息可靠性与展示顺序。
-
-## 按学习顺序讲解
-
-### 1. 帧收发
-
-- `sendFrame(fd,payload)`：调用公共编码器，并在全局发送锁内循环 `send` 直到整帧发完；处理 `EINTR`，避免多个后台线程把字节交叉写入同一 socket。
-- `recvAll(fd,buf,n)`：精确读取 n 字节，解决一次 `recv` 不保证返回全部数据的问题。
-- `recvFrame(fd)`：先读 4 字节头、校验长度，再读完整 payload；失败返回空串。
-
-### 2. 唯一 ID 与会话序列
-
-- `SnowflakeIdGenerator(workerId)`：将 worker 限制为 10 位。
-- `setWorkerId(workerId)`：登录后用用户 ID 低 10 位更新 worker，持锁保证并发安全。
-- `nextId()`：组合 41 位相对时间、10 位 worker 和 12 位毫秒序列；时钟回拨时保持不倒退，序列耗尽时等待下一毫秒。
-- `nowMs()`、`waitNextMs(lastTs)`：分别读取毫秒时间和等待时间越过上一毫秒。
-- `nextClientSeqForPeer(toid)`、`nextClientSeqForGroup(groupid)`：分别按接收者、群组维护单调序列，避免不同会话互相影响。
-- `generateMsgId()`：把雪花 ID 转成字符串作为 `message_id`。
-
-### 3. ACK 与重试
-
-- `addPending(msgId,payload)`：同时记录待确认负载、发送时刻和重试次数。
-- `removePending(msgId)`：收到成功/去重 ACK 或本地发送失败后清理三张表。
-- `retryTaskHandler()`：每秒扫描一次；超过 5 秒未确认则最多重发 3 次。锁内只整理任务，锁外执行网络发送，减少阻塞。
-- `heartbeatTaskHandler(clientfd)`：登录后每 10 秒发心跳；上一轮未确认时告警，本轮发送前重置 ACK 状态。
-
-### 4. 主线程与响应同步
-
-- `responseVersion()`：读取当前响应版本。
-- `waitForResponse(previousVersion)`：条件变量等待版本增长，避免登录/注册用忙等轮询。
-- `notifyResponse()`：接收线程处理登录或注册响应后增加版本并唤醒主线程。
-- `main(argc,argv)`：解析地址、连接 socket，启动接收/重试/排序/心跳线程，再运行登录注册菜单。
-
-### 5. 收包、离线数据和顺序显示
-
-- `buildSessionKey(js)`：单聊按发送者，群聊按“群 ID + 发送者”隔离顺序空间。
-- `formatIncomingLine(js)`：把消息格式化成命令行文本。
-- `printOrderedIncoming(js)`：无序号时直接显示；有序号时去掉旧消息，把新消息放入有序 map，并连续输出 `last+1`。
-- `orderFlushTaskHandler()`：序号缺口超过 2 秒或缓存达到 100 条时跳过缺口，避免永久队头阻塞。
-- `doRegResponse(response)`：打印注册成功 ID 或失败。
-- `doLoginResponse(response)`：设置当前用户和雪花 worker，解析嵌套好友/群/离线消息，最后标记登录成功。
-- `readTaskHandler(clientfd)`：持续收完整帧并分派；ACK_OK/DEDUP 清 pending，聊天消息进入排序器，心跳 ACK 更新连接状态，错误统一打印，登录/注册响应通知主线程。
-- `showCurrentUserData()`：打印当前用户、好友和群成员。
-- `getCurrentTime()`：用线程安全的 `localtime_r` 生成消息显示时间。
-
-### 6. 命令系统
-
-- `mainMenu(clientfd)`：解析第一个冒号前的命令，并通过函数表分派。
-- `help(...)`：列出命令和格式。
-- `addfriend(clientfd,str)`：发送加好友请求。
-- `chat(clientfd,str)`：解析目标与内容，附加时间、单聊序列和消息 ID，先入 pending 再发送。
-- `creategroup(clientfd,str)`：解析群名称和描述并发送。
-- `addgroup(clientfd,str)`：发送加入群请求。
-- `groupchat(clientfd,str)`：附加群序列和消息 ID，走 pending/ACK 流程。
-- `loginout(clientfd,...)`：发送注销，退出主菜单并停止登录态心跳。
-
-## 函数详细说明
-
-### `sendFrame(int fd, const string &payload)`
-
-函数先调用公共 `encodeFrame` 把 JSON 正文编码为“4 字节网络序长度 + payload”，再持有全局发送互斥锁循环调用 `send`，直到整个帧写完。一次 `send` 可能只接受部分字节，遇到 `EINTR` 也应继续，因此不能把返回值大于零就当作整帧成功。
-
-发送锁覆盖完整帧而不是单次系统调用，可防止接收线程之外的重试线程、心跳线程和主菜单线程同时写 socket 时把两个帧的字节交叉。函数失败时返回错误，调用方据此保留 pending 或提示断线。
-
-### `recvAll(int fd, void *buffer, size_t length)`
-
-这是精确读取辅助函数。它维护已读取偏移，重复调用 `recv` 直到获得指定字节数；返回 0 表示对端正常关闭，负值且不是 `EINTR` 表示错误，二者都返回 false。该函数适合固定长度头和已知长度正文，但会阻塞当前接收线程直到数据齐全或连接结束。
-
-### `recvFrame(int fd)`
-
-函数先用 `recvAll` 读取 4 字节头，通过公共协议函数解码网络序长度并检查最大帧限制，再精确读取正文。它把 TCP 字节流恢复为一个完整 JSON 消息，天然处理拆包，也不会把粘在后面的下一帧误当成本帧正文。返回空串代表关闭或协议错误，因此当前协议若允许零长度业务帧，需要另设状态区分。
-
-### `SnowflakeIdGenerator::SnowflakeIdGenerator(uint64_t workerId)`
-
-构造函数设置节点位，并把输入限制在雪花算法预留的 10 位范围内。客户端稍后会用登录用户 ID 的低位更新 worker，使同一时刻不同用户生成相同 ID 的概率进一步降低。
-
-### `SnowflakeIdGenerator::setWorkerId(uint64_t workerId)`
-
-登录成功后调用该函数更新 workerId。修改过程持有生成器内部锁，避免重试或其他线程正生成 ID 时读到中间状态。截断到 10 位意味着用户数超过 1024 后 worker 会重复，真正的唯一性还依赖时间戳和序列；严格分布式部署应由中心或配置系统分配节点号。
-
-### `SnowflakeIdGenerator::nextId()`
-
-函数在锁内读取当前毫秒时间。如果本机时钟小幅回拨，就使用上一时间戳，保证生成结果不倒退；同一毫秒内递增 12 位序列，序列达到上限后等待下一毫秒。最后把相对 epoch 时间、workerId 和序列移位组合成 64 位整数。
-
-这种实现保证单进程生成器内单调且不重复，但无法完全抵御进程重启、worker 冲突和长时间时钟回拨。项目把结果转成字符串传输，可避免 JavaScript 对大于 `2^53-1` 整数的精度丢失。
-
-### `SnowflakeIdGenerator::nowMs()` 与 `waitNextMs(uint64_t lastTimestamp)`
-
-`nowMs` 从系统时钟取得毫秒值；`waitNextMs` 在序列用尽时循环读取，直到时间超过上一毫秒。后者确保序列回零前时间位已经变化，但忙等会短暂占用 CPU，高吞吐客户端可改为更精细的等待或批量分配。
-
-### `nextClientSeqForPeer(int toId)` 与 `nextClientSeqForGroup(int groupId)`
-
-两个函数分别在互斥锁保护下维护单聊目标和群组的递增计数。序列按会话划分，而不是全客户端共用，因此一个繁忙群聊不会让其他会话出现大量无关缺口。接收端结合发送者与会话 ID 建立相同顺序域。
-
-### `generateMsgId()`
-
-调用雪花生成器取得 64 位 ID，再转换为十进制字符串。字符串形式既适合做 Redis 去重键，也能让 C++、Node.js 和浏览器之间无损传递。
-
-### `addPending(const string &msgId, const string &payload)`
-
-首次发送可靠消息前，函数在锁内同时保存原始 payload、最近发送时间和重试次数。先登记再发送能避免服务端极快返回 ACK，而接收线程查不到 pending 的竞态。若首次系统调用立即失败，调用方需要根据策略删除或保留记录。
-
-### `removePending(const string &msgId)`
-
-函数从 payload、时间和次数三张 pending 表同步删除同一 ID。成功 ACK 和 `ACK_DEDUP` 都表示服务端已经接受过这条业务消息，可以清除；保持三张表同步可避免重试线程访问到残缺状态。工程上可把三个字段封装成单个结构和一张 map，减少一致性负担。
-
-### `retryTaskHandler()`
-
-后台任务周期扫描 pending。消息超过 ACK 等待阈值且未达到最大次数时，函数更新重试次数和时间，并复制 payload 到待发送列表；超过上限则报告失败并清理状态。真正的 `sendFrame` 在释放 pending 锁后执行，避免网络阻塞阻塞 ACK 接收和新消息登记。
-
-重试仍使用原 `message_id`，这是服务端能够识别重复投递的前提。若每次重试生成新 ID，ACK 丢失会造成对方重复收到消息。
-
-### `heartbeatTaskHandler(int clientfd)`
-
-登录态后台线程按固定周期发送包含当前用户 ID 的心跳。发送前检查上一轮心跳 ACK，未确认会输出连接异常提示；随后重置状态并发送新一轮。服务端用心跳续期 Redis 在线路由，客户端也借此发现“TCP 表面存在但业务链路已失效”的情况。
-
-### `responseVersion()`、`waitForResponse(uint64_t previousVersion)` 与 `notifyResponse()`
-
-这三个函数共同完成主线程和接收线程的响应同步。主线程在发送登录/注册请求前记录版本，随后在条件变量上等待版本增长；接收线程处理对应响应后递增版本并通知。条件谓词可处理虚假唤醒，也不会因为响应在 `wait` 前到达而永久错过。
-
-版本表示“又收到一个需要唤醒主线程的响应”，如果未来允许多个并发登录类请求，还应使用 request ID 将响应与具体请求对应。
-
-### `buildSessionKey(const json &js)`
-
-函数为收到的聊天消息生成排序域。单聊通常以发送者 ID 为关键部分；群聊同时包含群 ID 和发送者 ID，因为不同发送者各自维护客户端序列。会话键设计必须与发送端序列生成规则一致，否则本来无关的消息会互相等待缺失序号。
-
-### `formatIncomingLine(const json &js)`
-
-把 JSON 中的发送者、时间、群 ID 和正文转换为用户可读的一行文本。格式化与排序分离后，排序缓存可以保存结构化消息，在真正输出时统一展示。读取可选字段时应使用默认值，避免旧客户端消息缺字段导致接收线程异常退出。
-
-### `printOrderedIncoming(const json &js)`
-
-没有 `client_seq` 的旧消息直接显示。带序列的消息先根据会话键取得状态：序号小于等于已输出值时视为迟到或重复并丢弃；更大的序号放入有序 map。随后从 `lastPrinted + 1` 开始连续取出并输出，直到遇到缺口。
-
-该函数解决的是客户端观察到的会话内乱序。它不能改变服务端和网络真实到达顺序，也不能凭空恢复永久丢失的消息，所以还需要超时放行策略。
-
-### `orderFlushTaskHandler()`
-
-后台任务检查各会话排序缓存。若最小待输出序号前存在缺口，并且等待超过阈值或缓存达到容量上限，函数会把最小现有序号作为新的连续起点继续输出，避免一条永久缺失消息造成后续全部阻塞。输出动作和状态修改需要正确控制锁范围，防止接收线程同时插入导致迭代器失效。
-
-这一策略在“严格不乱序”和“界面不永久卡住”之间选择了有界等待。生产 IM 通常还会向服务端请求缺失区间，而不是直接跳洞。
-
-### `doRegResponse(const json &response)`
-
-解析注册响应状态。成功时打印服务端分配的用户 ID，提醒用户保存；失败时展示错误码或错误信息。处理结束调用响应通知，使正在等待的菜单线程继续。
-
-### `doLoginResponse(const json &response)`
-
-登录失败时输出原因并保持未登录状态。成功时保存当前用户对象，将用户 ID 低位设置为雪花 worker，并解析服务端返回的好友、群组和离线消息列表。原项目把部分列表元素以 JSON 字符串嵌套在数组中，函数需要逐项再次解析。
-
-离线聊天消息同样进入排序显示流程，而不是绕过实时消息规则。全部状态准备完成后再标记登录成功并唤醒菜单线程，避免主线程提前进入命令界面却读到半初始化数据。
-
-### `readTaskHandler(int clientfd)`
-
-这是唯一持续读 socket 的线程。它循环调用 `recvFrame`，解析 JSON 后按 `msgid` 分派：登录/注册响应交给专用函数；聊天消息进入会话排序器；`MSG_ACK` 根据状态清除或保留 pending；心跳 ACK 更新存活标记；统一错误消息负责展示。
-
-由单一线程读取可以避免多个线程争抢字节流边界。解析和字段访问必须捕获异常，任何未处理异常都可能让接收线程退出，继而表现为客户端再也收不到 ACK。连接关闭后函数还应通知其他后台任务停止，并唤醒正在等待响应的主线程。
-
-### `showCurrentUserData()`
-
-打印登录用户基本资料、好友在线状态以及群组和成员信息，帮助用户在进入命令循环前了解可用对象。它只展示登录响应时获得的快照；好友上下线或群成员变化若没有增量推送，数据不会自动实时更新。
-
-### `getCurrentTime()`
-
-读取系统时间并用 `localtime_r` 转换为本地时间，再格式化为消息时间字符串。`localtime_r` 使用调用方提供的结构体，适合多线程客户端；普通 `localtime` 返回共享静态存储，可能被其他线程覆盖。
-
-### `main(int argc, char **argv)`
-
-程序入口解析服务器地址和端口，创建 TCP socket 并建立连接。连接成功后启动接收、重试、排序刷新等后台任务，然后进入注册/登录菜单；登录成功后再启动或激活心跳与业务命令流程。
-
-它还负责进程级错误处理和退出。当前代码使用分离线程和全局状态，退出时往往依赖关闭 socket 或直接结束进程；更工程化的实现应使用可连接线程、原子停止标志和 RAII socket，在退出前按顺序停止生产任务、关闭连接并 join 所有线程。
-
-### `mainMenu(int clientfd)`
-
-函数读取用户输入，以第一个冒号前的文本作为命令名，剩余部分作为参数，再从命令函数表找到对应处理器。表驱动分派让新增命令只需注册名称和函数，避免长 `if/else`。未识别命令会提示帮助，输入退出或注销后离开循环。
-
-### `help(int clientfd, const string &args)`
-
-输出所有命令及参数格式，不访问网络。虽然签名与其他命令一致，`clientfd` 和参数可能未使用，这是为了能放入统一函数表。
-
-### `addfriend(int clientfd, const string &args)`
-
-解析好友用户 ID，构造包含当前登录用户 ID 和目标 ID 的加好友请求并发送。客户端输入校验只改善体验，服务端仍必须验证身份、目标合法性和重复关系，因为客户端数据不可信。
-
-### `chat(int clientfd, const string &args)`
-
-解析“目标用户 ID:消息正文”，生成会话内序列、时间和唯一 `message_id`，构造单聊 JSON。函数先调用 `addPending` 再发送，以防 ACK 先于登记到达；首次发送失败时输出错误，后续由策略决定重试。正文可能包含冒号，因此解析时应只切分第一个分隔位置。
-
-### `creategroup(int clientfd, const string &args)`
-
-从输入中解析群名称和描述，构造建群请求。名称/描述的长度与空值可在本地预检，但权限和数据库唯一性必须由服务端最终判断。
-
-### `addgroup(int clientfd, const string &args)`
-
-解析群 ID 并发送入群请求。当前命令通常没有等待独立响应刷新本地群列表，用户可能需要重新登录才能看到最新快照，是可以继续完善的交互点。
-
-### `groupchat(int clientfd, const string &args)`
-
-解析“群 ID:消息正文”，生成按群维护的客户端序列和消息 ID，再登记 pending 并发送。服务端会验证发送者身份，但若未验证群成员资格，非成员伪造群 ID 仍可能发送，因此权限检查必须落在服务端模型查询中。
-
-### `loginout(int clientfd, const string &args)`
-
-构造注销请求并发送，随后结束登录态命令循环、停止心跳或清理本地用户状态。请求中的用户 ID只是声明，服务端会与连接绑定身份核对；即使注销响应丢失，TCP 关闭后的异常清理也应释放当前节点路由。
+**C++ 命令行客户端。** 实现长度帧收发、登录注册、聊天命令、心跳、ACK 重试和按会话顺序展示。多个后台线程共享 socket 与待确认表，因此写锁和条件变量决定其可靠性。
+
+阅读位置：`src/client/main.cpp`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
+
+## 代码片段与详细讲解
+
+### 片段 1：第 1-26 行
+
+```cpp
+#include "json.hpp"
+#include <iostream>
+#include <thread>
+#include <string>
+#include <vector>
+#include <chrono>
+#include <ctime>
+#include <unordered_map>
+#include <functional>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <map>
+#include <algorithm>
+#include <cstdint>
+#include <tuple>
+#include <cerrno>
+#include <csignal>
+using namespace std;
+using json = nlohmann::json;
+
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+```
+
+这些头文件把“C++ 命令行客户端”接到项目公共协议、领域对象和所需系统库。依赖方向保持从实现到接口：模型不知道网络连接，帧工具不知道用户业务，当前文件负责在自己的层内组合它们。
+
+### 片段 2：第 27-48 行
+
+```cpp
+
+#include "group.hpp"
+#include "user.hpp"
+#include "public.hpp"
+#include "frameprotocol.hpp"
+
+// ============================================================
+// 帧协议辅助函数（客户端版）
+// 帧结构：[4字节 payload_len（网络字节序大端）][payload(JSON字符串)]
+// ============================================================
+
+// 心跳、重试线程和交互线程共享一个 socket；整帧发送必须串行化。
+static mutex g_sendMutex;
+
+// 将 JSON payload 打包成帧发送，返回发送字节数，-1表示失败
+static int sendFrame(int fd, const string &payload)
+{
+    string frame;
+    try
+    {
+        frame = chatserver::protocol::encodeFrame(payload);
+    }
+```
+
+发送端先生成 4 字节长度头，再在写锁下循环 `send` 直到整个帧写完。锁保证心跳、重试和前台命令不会把各自字节交叉到同一 TCP 流。
+
+### 片段 3：第 49-76 行
+
+```cpp
+    catch (const length_error &)
+    {
+        return -1;
+    }
+
+    lock_guard<mutex> lock(g_sendMutex);
+    size_t total = frame.size(), sent = 0;
+    while (sent < total)
+    {
+        ssize_t n = ::send(fd, frame.data() + sent, total - sent, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        sent += n;
+    }
+    return (int)sent;
+}
+
+// 精确读取 n 字节
+static bool recvAll(int fd, char *buf, size_t n)
+{
+    size_t got = 0;
+    while (got < n)
+    {
+        ssize_t r = ::recv(fd, buf + got, n - got, 0);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return false;
+        got += r;
+    }
+```
+
+互斥区保护 `共享状态` 的一致性。这里需要关注的不只是单个容器不崩溃，还要保证成对索引或链表/哈希表同步更新，其他 I/O 线程不会观察到一半完成的状态。
+
+循环每次只消费已经确认完整的字节或已经成功写出的部分。遇到正文尚未到齐便停在当前偏移，下一次收到数据后继续；发送短写则从剩余位置续发，这正是流式 socket 不能假设“一次调用完成一条消息”的原因。
+
+### 片段 4：第 77-104 行
+
+```cpp
+    return true;
+}
+
+// 接收一个完整帧，返回 payload 字符串，失败返回空串
+static string recvFrame(int fd)
+{
+    char header[4] = {0};
+    if (!recvAll(fd, header, 4)) return "";
+    uint32_t payloadLen = chatserver::protocol::decodeFrameLength(header);
+    if (!chatserver::protocol::isValidPayloadLength(payloadLen)) return "";
+    string payload(payloadLen, '\0');
+    if (!recvAll(fd, &payload[0], payloadLen)) return "";
+    return payload;
+}
+
+// ============================================================
+// 消息ID生成与 pending 管理
+// 每条业务消息携带唯一 message_id，收到服务端 MSG_ACK 后移出 pending
+// ============================================================
+static atomic_int g_myUserId{0};
+
+// Snowflake 64位ID生成器：
+// 1位符号位(固定0) + 41位时间戳差值 + 10位workerId + 12位毫秒内序列
+class SnowflakeIdGenerator
+{
+public:
+    explicit SnowflakeIdGenerator(uint16_t workerId = 1)
+        : _workerId(workerId & WORKER_ID_MASK) {}
+```
+
+接收端先精确读取 4 字节头，校验长度后再精确读取 payload。网络一次 `recv` 可能只返回一部分，所以底层循环是避免把半包误当完整 JSON 的关键。
+
+消息 id 生成器把毫秒时间、客户端 workerId 和同毫秒序号组合成唯一值；时钟未前进时递增序号，序号耗尽便等待下一毫秒。转换为字符串后，它既可作为 pending 表键，也可跨 Redis 节点去重。
+
+### 片段 5：第 105-129 行
+
+```cpp
+
+    void setWorkerId(uint16_t workerId)
+    {
+        lock_guard<mutex> lock(_mtx);
+        _workerId = workerId & WORKER_ID_MASK;
+    }
+
+    uint64_t nextId()
+    {
+        lock_guard<mutex> lock(_mtx);
+
+        uint64_t ts = nowMs();
+        if (ts < _lastTs)
+        {
+            // 时钟回拨保护：回拨窗口内强制使用 lastTs，保证单调不倒退
+            ts = _lastTs;
+        }
+
+        if (ts == _lastTs)
+        {
+            _seq = (_seq + 1) & SEQ_MASK;
+            if (_seq == 0)
+            {
+                ts = waitNextMs(_lastTs);
+            }
+```
+
+这部分完成“C++ 命令行客户端”中的边界分支：无效输入或外部操作失败会在写入后续状态前结束，成功路径才把结果交给相邻模块。这样返回值不仅代表函数结束，还决定上层能否发送成功响应或继续投递。
+
+### 片段 6：第 130-157 行
+
+```cpp
+        }
+        else
+        {
+            _seq = 0;
+        }
+
+        _lastTs = ts;
+
+        uint64_t id = ((ts - EPOCH_MS) << TIMESTAMP_SHIFT)
+                    | (static_cast<uint64_t>(_workerId) << WORKER_ID_SHIFT)
+                    | _seq;
+        return id;
+    }
+
+private:
+    static uint64_t nowMs()
+    {
+        return chrono::duration_cast<chrono::milliseconds>(
+            chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    static uint64_t waitNextMs(uint64_t lastTs)
+    {
+        uint64_t ts = nowMs();
+        while (ts <= lastTs)
+        {
+            ts = nowMs();
+        }
+```
+
+这一接口片段规定“C++ 命令行客户端”对外可用的操作和对象必须长期保存的状态。调用者只依赖这里的契约；锁、SQL、网络错误和资源释放留在实现内部，因此更换基础设施不会迫使业务处理器改写所有调用点。
+
+### 片段 7：第 158-183 行
+
+```cpp
+        return ts;
+    }
+
+private:
+    static constexpr uint64_t EPOCH_MS = 1704067200000ULL; // 2024-01-01 00:00:00 UTC
+    static constexpr uint64_t WORKER_ID_BITS = 10;
+    static constexpr uint64_t SEQ_BITS = 12;
+    static constexpr uint64_t WORKER_ID_MASK = (1ULL << WORKER_ID_BITS) - 1;
+    static constexpr uint64_t SEQ_MASK = (1ULL << SEQ_BITS) - 1;
+    static constexpr uint64_t WORKER_ID_SHIFT = SEQ_BITS;
+    static constexpr uint64_t TIMESTAMP_SHIFT = WORKER_ID_BITS + SEQ_BITS;
+
+    mutex _mtx;
+    uint16_t _workerId = 1;
+    uint64_t _lastTs = 0;
+    uint64_t _seq = 0;
+};
+
+static SnowflakeIdGenerator g_snowflake(1);
+
+// 发送端序列号：
+// - 单聊：每个接收者(toid)独立递增
+// - 群聊：每个群组(groupid)独立递增
+static mutex g_clientSeqMutex;
+static unordered_map<int, uint64_t> g_peerClientSeq;
+static unordered_map<int, uint64_t> g_groupClientSeq;
+```
+
+这一接口片段规定“C++ 命令行客户端”对外可用的操作和对象必须长期保存的状态。调用者只依赖这里的契约；锁、SQL、网络错误和资源释放留在实现内部，因此更换基础设施不会迫使业务处理器改写所有调用点。 这里固定雪花 ID 的纪元和位宽，决定时间、worker 与同毫秒序号如何拼接，也决定可支持的节点数和每毫秒上限。
+
+### 片段 8：第 184-207 行
+
+```cpp
+
+static uint64_t nextClientSeqForPeer(int toid)
+{
+    lock_guard<mutex> lock(g_clientSeqMutex);
+    uint64_t &seq = g_peerClientSeq[toid];
+    seq += 1;
+    return seq;
+}
+
+static uint64_t nextClientSeqForGroup(int groupid)
+{
+    lock_guard<mutex> lock(g_clientSeqMutex);
+    uint64_t &seq = g_groupClientSeq[groupid];
+    seq += 1;
+    return seq;
+}
+
+static string generateMsgId()
+{
+    return to_string(g_snowflake.nextId());
+}
+
+static mutex g_pendingMutex;
+static map<string, string> g_pendingMap; // msgId -> payload
+```
+
+超时扫描只在锁内决定哪些消息重发或放弃，并同步更新计时与次数；真正写 socket 在锁外执行。达到上限的 id 从全部 pending 表删除并单独告警，防止同一失败项永久占用内存和反复发送。
+
+### 片段 9：第 208-236 行
+
+```cpp
+
+// 记录每条消息的发送时间戳，用于超时重试判断
+static map<string, chrono::steady_clock::time_point> g_pendingTime;
+// 超时重试间隔：5秒未收到ACK则重发
+static const int RETRY_TIMEOUT_SEC = 5;
+// 最大重试次数：超过后放弃并从pending移除
+static const int MAX_RETRY_COUNT = 3;
+
+// 应用层心跳间隔（秒）：定时向服务端发送 HEARTBEAT_MSG
+static const int HEARTBEAT_INTERVAL_SEC = 10;
+static atomic_bool g_heartbeatAcked{true};
+static map<string, int> g_pendingRetry; // msgId -> 已重试次数
+static int g_retryClientFd = -1; // 重试线程使用的socket fd
+
+static void addPending(const string &msgId, const string &payload)
+{
+    lock_guard<mutex> lock(g_pendingMutex);
+    g_pendingMap[msgId] = payload;
+    g_pendingTime[msgId] = chrono::steady_clock::now();
+    g_pendingRetry[msgId] = 0;
+}
+
+static void removePending(const string &msgId)
+{
+    lock_guard<mutex> lock(g_pendingMutex);
+    g_pendingMap.erase(msgId);
+    g_pendingTime.erase(msgId);
+    g_pendingRetry.erase(msgId);
+}
+```
+
+三张 pending 状态以同一个 message_id 对齐：保存原 payload 才能原样重发，重试次数限制无限发送，首次/上次时间决定何时重试。ACK 到达时必须同时删除这些记录，否则后台线程还会发送已经成功的消息。
+
+### 片段 10：第 237-266 行
+
+```cpp
+
+// 重试线程：每秒扫描一次 pending_map，对超时未收到ACK的消息执行重发
+// 超过 MAX_RETRY_COUNT 次后放弃，打印告警
+static void retryTaskHandler()
+{
+    while (true)
+    {
+        this_thread::sleep_for(chrono::seconds(1));
+        if (g_retryClientFd < 0) continue;
+
+        vector<tuple<string,string,int>> toRetry;
+        vector<string> toRemove;
+
+        {
+            lock_guard<mutex> lock(g_pendingMutex);
+            auto now = chrono::steady_clock::now();
+            for (auto &kv : g_pendingMap)
+            {
+                auto elapsed = chrono::duration_cast<chrono::seconds>(
+                    now - g_pendingTime[kv.first]).count();
+                if (elapsed >= RETRY_TIMEOUT_SEC)
+                {
+                    int &cnt = g_pendingRetry[kv.first];
+                    if (cnt < MAX_RETRY_COUNT)
+                    {
+                        int nextRetry = ++cnt;
+                        toRetry.emplace_back(kv.first, kv.second, nextRetry);
+                        // 重置计时，等待下一轮ACK
+                        g_pendingTime[kv.first] = now;
+                    }
+```
+
+线程定期扫描 pending 表：超过 ACK 等待时间的消息增加重试次数并重新发送，达到上限则移除并提示失败。扫描时只整理待发送副本，真正 socket 写在锁外完成，降低对前台发送的阻塞。
+
+### 片段 11：第 267-290 行
+
+```cpp
+                    else
+                    {
+                        // 超过最大重试次数，放弃
+                        toRemove.push_back(kv.first);
+                    }
+                }
+            }
+            for (auto &id : toRemove)
+            {
+                g_pendingMap.erase(id);
+                g_pendingTime.erase(id);
+                g_pendingRetry.erase(id);
+            }
+        }
+
+        for (auto &kv : toRetry)
+        {
+            const string &msgId = get<0>(kv);
+            const string &payload = get<1>(kv);
+            int retryCnt = get<2>(kv);
+            cerr << "[retry] resending message_id=" << msgId
+                 << " (retry " << retryCnt << "/" << MAX_RETRY_COUNT << ")" << endl;
+            sendFrame(g_retryClientFd, payload);
+        }
+```
+
+超时扫描只在锁内决定哪些消息重发或放弃，并同步更新计时与次数；真正写 socket 在锁外执行。达到上限的 id 从全部 pending 表删除并单独告警，防止同一失败项永久占用内存和反复发送。 这里执行扫描结果：先从三张待确认表同步删除放弃项，再在锁外发送重试副本，最后逐条打印达到上限的 message_id。
+
+### 片段 12：第 291-316 行
+
+```cpp
+        for (auto &id : toRemove)
+        {
+            cerr << "[retry] give up message_id=" << id
+                 << ", max retry reached, message may be lost" << endl;
+        }
+    }
+}
+
+// 心跳线程：周期发送 HEARTBEAT_MSG，若连续未收到ACK可快速识别异常连接
+static void heartbeatTaskHandler(int clientfd)
+{
+    while (true)
+    {
+        this_thread::sleep_for(chrono::seconds(HEARTBEAT_INTERVAL_SEC));
+
+        // 仅登录后发送心跳，避免登录前无意义探测
+        if (g_myUserId.load() <= 0)
+        {
+            continue;
+        }
+
+        json hb;
+        hb["msgid"] = HEARTBEAT_MSG;
+        hb["id"] = g_myUserId.load();
+        hb["ts"] = chrono::duration_cast<chrono::milliseconds>(
+            chrono::system_clock::now().time_since_epoch()).count();
+```
+
+超时扫描只在锁内决定哪些消息重发或放弃，并同步更新计时与次数；真正写 socket 在锁外执行。达到上限的 id 从全部 pending 表删除并单独告警，防止同一失败项永久占用内存和反复发送。 这里执行扫描结果：先从三张待确认表同步删除放弃项，再在锁外发送重试副本，最后逐条打印达到上限的 message_id。 源码在这一段特别限定了“心跳线程：周期发送 HEARTBEAT_MSG，若连续未收到ACK可快速识别异常连接”，因此解释范围止于该局部步骤。
+
+### 片段 13：第 317-342 行
+
+```cpp
+
+        // 上一轮心跳若还未被ACK，打印告警（不立刻断线，避免误判）
+        if (!g_heartbeatAcked.load())
+        {
+            cerr << "[heartbeat] previous heartbeat not acked yet, connection may be unstable" << endl;
+        }
+
+        g_heartbeatAcked = false;
+        if (sendFrame(clientfd, hb.dump()) == -1)
+        {
+            cerr << "[heartbeat] send heartbeat failed" << endl;
+        }
+    }
+}
+
+// ============================================================
+// 原有全局状态
+// ============================================================
+User g_currentUser;
+vector<User> g_currentUserFriendList;
+vector<Group> g_currentUserGroupList;
+atomic_bool isMainMenuRunning{false};
+atomic_bool g_isLoginSuccess{false};
+static mutex g_responseMutex;
+static condition_variable g_responseCv;
+static uint64_t g_responseVersion = 0;
+```
+
+登录后才周期发送心跳。发送下一轮前若上一轮仍未确认，只提示连接可能不稳定而不立即断开，减少短暂调度延迟造成误判；收到 HEARTBEAT_ACK 后接收线程会重新设置确认标志。
+
+### 片段 14：第 343-376 行
+
+```cpp
+
+static uint64_t responseVersion()
+{
+    lock_guard<mutex> lock(g_responseMutex);
+    return g_responseVersion;
+}
+
+static void waitForResponse(uint64_t previousVersion)
+{
+    unique_lock<mutex> lock(g_responseMutex);
+    g_responseCv.wait(lock, [previousVersion] { return g_responseVersion > previousVersion; });
+}
+
+static void notifyResponse()
+{
+    {
+        lock_guard<mutex> lock(g_responseMutex);
+        ++g_responseVersion;
+    }
+    g_responseCv.notify_one();
+}
+
+// 每个会话（单聊按发送者id，群聊按groupid+发送者id）最后已显示的 client_seq
+static unordered_map<string, uint64_t> g_lastShownSeq;
+// 乱序缓冲：key=session, value=(seq -> message)
+struct BufferedMessage
+{
+    string line;
+    chrono::steady_clock::time_point receivedAt;
+};
+static unordered_map<string, map<uint64_t, BufferedMessage>> g_orderBuffer;
+static mutex g_orderMutex;
+static constexpr int ORDER_GAP_TIMEOUT_MS = 2000;
+static constexpr size_t ORDER_BUFFER_MAX_PER_SESSION = 100;
+```
+
+主线程发送登录/注册后记录响应版本，并在条件变量上等待版本变化。接收线程处理响应后递增版本再唤醒；使用版本谓词可抵抗虚假唤醒，也不会把上一次响应误当成当前请求完成。
+
+### 片段 15：第 377-401 行
+
+```cpp
+
+static string buildSessionKey(const json &js)
+{
+    if (ONE_CHAT_MSG == js["msgid"].get<int>())
+    {
+        // 单聊：按发送者维度重排
+        return string("u:") + to_string(js["id"].get<int>());
+    }
+
+    // 群聊：按“群+发送者”维度重排，避免不同发送者序号混用
+    return string("g:") + to_string(js["groupid"].get<int>()) +
+           ":u:" + to_string(js["id"].get<int>());
+}
+
+static string formatIncomingLine(const json &js)
+{
+    if (ONE_CHAT_MSG == js["msgid"].get<int>())
+    {
+        return js["time"].get<string>() + " [" + to_string(js["id"].get<int>()) + "]" +
+               js["name"].get<string>() + " said: " + js["msg"].get<string>();
+    }
+    return string("群消息[") + to_string(js["groupid"].get<int>()) + "]:" +
+           js["time"].get<string>() + " [" + to_string(js["id"].get<int>()) + "]" +
+           js["name"].get<string>() + " said: " + js["msg"].get<string>();
+}
+```
+
+这一组值把部署差异留在环境层：服务进程和 Compose 使用同名键，测试还可临时调大消息数或超时。示例文件只给安全占位和本机默认，不应保存真实生产密码。
+
+### 片段 16：第 402-433 行
+
+```cpp
+
+static void printOrderedIncoming(const json &js)
+{
+    if (!js.contains("client_seq"))
+    {
+        cout << formatIncomingLine(js) << endl;
+        return;
+    }
+
+    string key = buildSessionKey(js);
+    uint64_t seq = js["client_seq"].get<uint64_t>();
+    lock_guard<mutex> lock(g_orderMutex);
+    uint64_t &last = g_lastShownSeq[key];
+
+    if (seq <= last)
+    {
+        return; // 重复/过期消息
+    }
+
+    g_orderBuffer[key][seq] = {formatIncomingLine(js), chrono::steady_clock::now()};
+
+    // 连续可显示的序号依次输出
+    auto &buf = g_orderBuffer[key];
+    while (!buf.empty())
+    {
+        auto it = buf.begin();
+        if (it->first == last + 1)
+        {
+            cout << it->second.line << endl;
+            last = it->first;
+            buf.erase(it);
+        }
+```
+
+消息按“会话 + 发送者”维护下一期望序号和缓冲 map。等于期望值时输出并连续冲刷后继；大于期望值先缓存；序号洞超过等待时间后由后台任务跳过，避免永远卡住后续消息。
+
+### 片段 17：第 434-465 行
+
+```cpp
+        else
+        {
+            break;
+        }
+    }
+}
+
+// 序号洞超过 2 秒后跳过缺失区间，避免后续消息永久队头阻塞。
+static void orderFlushTaskHandler()
+{
+    while (true)
+    {
+        this_thread::sleep_for(chrono::milliseconds(200));
+        lock_guard<mutex> lock(g_orderMutex);
+        const auto now = chrono::steady_clock::now();
+
+        for (auto &session : g_orderBuffer)
+        {
+            auto &buf = session.second;
+            uint64_t &last = g_lastShownSeq[session.first];
+            if (buf.empty()) continue;
+
+            auto first = buf.begin();
+            const auto waited = chrono::duration_cast<chrono::milliseconds>(
+                now - first->second.receivedAt).count();
+            if (first->first > last + 1 &&
+                (waited >= ORDER_GAP_TIMEOUT_MS || buf.size() >= ORDER_BUFFER_MAX_PER_SESSION))
+            {
+                cerr << "[order] missing seq " << (last + 1) << ".." << (first->first - 1)
+                     << ", flush buffered messages after timeout" << endl;
+                last = first->first - 1;
+            }
+```
+
+每个会话的顺序状态记录下一期望序号、暂存的较新消息和序号洞开始时间。例如先到 seq=5、后到 seq=4 时先缓存 5，输出 4 后立即连续输出 5；若 4 永不出现，超时冲刷避免界面永久阻塞。
+
+### 片段 18：第 466-494 行
+
+```cpp
+
+            while (!buf.empty() && buf.begin()->first == last + 1)
+            {
+                auto it = buf.begin();
+                cout << it->second.line << endl;
+                last = it->first;
+                buf.erase(it);
+            }
+        }
+    }
+}
+
+void readTaskHandler(int clientfd);
+static void heartbeatTaskHandler(int clientfd);
+string getCurrentTime();
+void mainMenu(int);
+void showCurrentUserData();
+
+// ============================================================
+// main：发送线程
+// ============================================================
+int main(int argc, char **argv)
+{
+    signal(SIGPIPE, SIG_IGN);
+    if (argc < 3)
+    {
+        cerr << "command invalid! example: ./ChatClient 127.0.0.1 6000" << endl;
+        exit(-1);
+    }
+```
+
+登录后才周期发送心跳。发送下一轮前若上一轮仍未确认，只提示连接可能不稳定而不立即断开，减少短暂调度延迟造成误判；收到 HEARTBEAT_ACK 后接收线程会重新设置确认标志。 这里启动或维护心跳后台任务；它与消息重试线程独立，前者维护在线路由租约，后者只关心业务 ACK。
+
+### 片段 19：第 495-516 行
+
+```cpp
+    char *ip = argv[1];
+    uint16_t port = atoi(argv[2]);
+
+    int clientfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (-1 == clientfd) { cerr << "socket create error" << endl; exit(-1); }
+
+    sockaddr_in server;
+    memset(&server, 0, sizeof(sockaddr_in));
+    server.sin_family = AF_INET;
+    server.sin_port = htons(port);
+    server.sin_addr.s_addr = inet_addr(ip);
+
+    if (-1 == connect(clientfd, (sockaddr *)&server, sizeof(sockaddr_in)))
+    { cerr << "connect server error" << endl; close(clientfd); exit(-1); }
+
+    std::thread readTask(readTaskHandler, clientfd);
+    readTask.detach();
+
+    // 启动重试线程：后台扫描 pending_map，对超时未收到ACK的消息重发
+    g_retryClientFd = clientfd;
+    std::thread retryTask(retryTaskHandler);
+    retryTask.detach();
+```
+
+进程按命令行地址创建 TCP socket，并把文本 IP 与端口转换为网络字节序后连接。连接成功后再启动接收、重试、顺序冲刷和心跳线程，避免后台任务在 fd 尚不可用时抢先发送。
+
+### 片段 20：第 517-546 行
+
+```cpp
+
+    std::thread orderFlushTask(orderFlushTaskHandler);
+    orderFlushTask.detach();
+
+    // 启动心跳线程：定时探测连接可用性
+    std::thread heartbeatTask(heartbeatTaskHandler, clientfd);
+    heartbeatTask.detach();
+
+    for (;;)
+    {
+        cout << "========================" << endl;
+        cout << "1. login" << endl;
+        cout << "2. register" << endl;
+        cout << "3. quit" << endl;
+        cout << "========================" << endl;
+        cout << "choice:";
+        int choice = 0;
+        cin >> choice;
+        cin.get();
+
+        switch (choice)
+        {
+        case 1:
+        {
+            int id = 0; char pwd[50] = {0};
+            cout << "userid:"; cin >> id; cin.get();
+            cout << "userpassword:"; cin.getline(pwd, 50);
+            json js;
+            js["msgid"] = LOGIN_MSG;
+            js["id"] = id;
+```
+
+登录后才周期发送心跳。发送下一轮前若上一轮仍未确认，只提示连接可能不稳定而不立即断开，减少短暂调度延迟造成误判；收到 HEARTBEAT_ACK 后接收线程会重新设置确认标志。 这里处理的不是心跳，而是序号洞超时：缓冲区等待超过阈值后，从当前最小可用序号继续输出，避免后续聊天永远被缺失序号阻塞。
+
+### 片段 21：第 547-575 行
+
+```cpp
+            js["password"] = pwd;
+            g_isLoginSuccess = false;
+            const uint64_t version = responseVersion();
+            // 使用帧协议发送
+            if (sendFrame(clientfd, js.dump()) == -1)
+            {
+                cerr << "send login msg error" << endl;
+                break;
+            }
+            waitForResponse(version);
+            if (g_isLoginSuccess) { isMainMenuRunning = true; mainMenu(clientfd); }
+        }
+        break;
+        case 2:
+        {
+            char name[50] = {0}, pwd[50] = {0};
+            cout << "username:"; cin.getline(name, 50);
+            cout << "userpassword:"; cin.getline(pwd, 50);
+            json js;
+            js["msgid"] = REG_MSG;
+            js["name"] = name;
+            js["password"] = pwd;
+            const uint64_t version = responseVersion();
+            // 使用帧协议发送
+            if (sendFrame(clientfd, js.dump()) == -1)
+            {
+                cerr << "send reg msg error" << endl;
+                break;
+            }
+```
+
+主线程发送登录/注册后记录响应版本，并在条件变量上等待版本变化。接收线程处理响应后递增版本再唤醒；使用版本谓词可抵抗虚假唤醒，也不会把上一次响应误当成当前请求完成。 这一段把前台登录/注册请求与接收线程响应配对：发送前记录版本，等待被唤醒后再依据共享成功标志进入菜单或继续选择。
+
+### 片段 22：第 576-605 行
+
+```cpp
+            waitForResponse(version);
+        }
+        break;
+        case 3:
+            close(clientfd); exit(0);
+        default:
+            cerr << "invalid input!" << endl; break;
+        }
+    }
+    return 0;
+}
+
+// 处理注册的响应逻辑
+void doRegResponse(json &responsejs)
+{
+    if (0 != responsejs["errno"].get<int>())
+        cerr << "name is already exist, register error!" << endl;
+    else
+        cout << "name register success, userid is " << responsejs["id"]
+             << ", do not forget it!" << endl;
+}
+
+// 处理登录的响应逻辑
+void doLoginResponse(json &responsejs)
+{
+    if (0 != responsejs["errno"].get<int>())
+    {
+        cerr << responsejs["errmsg"] << endl;
+        g_isLoginSuccess = false;
+    }
+```
+
+主线程发送登录/注册后记录响应版本，并在条件变量上等待版本变化。接收线程处理响应后递增版本再唤醒；使用版本谓词可抵抗虚假唤醒，也不会把上一次响应误当成当前请求完成。 这一段把前台登录/注册请求与接收线程响应配对：发送前记录版本，等待被唤醒后再依据共享成功标志进入菜单或继续选择。 源码在这一段特别限定了“处理注册的响应逻辑”，因此解释范围止于该局部步骤。
+
+### 片段 23：第 606-627 行
+
+```cpp
+    else
+    {
+        g_currentUser.setId(responsejs["id"].get<int>());
+        g_currentUser.setName(responsejs["name"]);
+        // 登录成功后设置全局用户ID，并作为雪花workerId的一部分
+        g_myUserId = g_currentUser.getId();
+        g_snowflake.setWorkerId(static_cast<uint16_t>(g_myUserId & 0x3FF));
+
+        if (responsejs.contains("friends"))
+        {
+            g_currentUserFriendList.clear();
+            vector<string> vec = responsejs["friends"];
+            for (string &str : vec)
+            {
+                json js = json::parse(str);
+                User user;
+                user.setId(js["id"].get<int>());
+                user.setName(js["name"]);
+                user.setState(js["state"]);
+                g_currentUserFriendList.push_back(user);
+            }
+        }
+```
+
+登录响应中的好友、群和离线消息数组保存的是嵌套 JSON 字符串。客户端逐项再次 parse，构造本地 User/Group 列表；离线聊天消息不直接打印，而是送入同一顺序缓冲逻辑，保证在线与恢复消息采用一致展示规则。
+
+### 片段 24：第 628-650 行
+
+```cpp
+
+        if (responsejs.contains("groups"))
+        {
+            g_currentUserGroupList.clear();
+            vector<string> vec1 = responsejs["groups"];
+            for (string &groupstr : vec1)
+            {
+                json grpjs = json::parse(groupstr);
+                Group group;
+                group.setId(grpjs["id"].get<int>());
+                group.setName(grpjs["groupname"]);
+                group.setDesc(grpjs["groupdesc"]);
+                vector<string> vec2 = grpjs["users"];
+                for (string &userstr : vec2)
+                {
+                    GroupUser user;
+                    json js = json::parse(userstr);
+                    user.setId(js["id"].get<int>());
+                    user.setName(js["name"]);
+                    user.setState(js["state"]);
+                    user.setRole(js["role"]);
+                    group.getUsers().push_back(user);
+                }
+```
+
+循环遍历 `groups`、`users`，把每个元素独立转换、投递或校验。结果按遍历顺序追加，某个元素失败时由本片段的状态变量或断言记录，不能用一次总体成功掩盖单项失败。
+
+### 片段 25：第 651-685 行
+
+```cpp
+                g_currentUserGroupList.push_back(group);
+            }
+        }
+
+        showCurrentUserData();
+
+        if (responsejs.contains("offlinemsg"))
+        {
+            vector<string> vec = responsejs["offlinemsg"];
+            for (string &str : vec)
+            {
+                json js = json::parse(str);
+                printOrderedIncoming(js);
+            }
+        }
+        g_isLoginSuccess = true;
+    }
+}
+
+// ============================================================
+// 1/2/3子线程 - 接收线程
+// 使用帧协议接收，每次 recvFrame() 得到完整 JSON
+// 处理 MSG_ACK：从 pending_map 移除对应消息
+// ============================================================
+void readTaskHandler(int clientfd)
+{
+    for (;;)
+    {
+        // 使用帧协议接收完整消息，无粘包/拆包问题
+        string payload = recvFrame(clientfd);
+        if (payload.empty())
+        {
+            close(clientfd);
+            exit(-1);
+        }
+```
+
+登录响应中的好友、群和离线消息数组保存的是嵌套 JSON 字符串。客户端逐项再次 parse，构造本地 User/Group 列表；离线聊天消息不直接打印，而是送入同一顺序缓冲逻辑，保证在线与恢复消息采用一致展示规则。 发送前创建 UUID、递增当前会话序号并立即插入本地消息；随后登记 pending 和发送 payload，用户能即时看到“发送中”，ACK 再更新为已发送。
+
+### 片段 26：第 686-707 行
+
+```cpp
+
+        json js;
+        try { js = json::parse(payload); }
+        catch (...) { cerr << "[recv] JSON parse error" << endl; continue; }
+
+        int msgtype = js["msgid"].get<int>();
+
+        // 处理服务端ACK：从 pending_map 移除对应消息
+        if (MSG_ACK == msgtype)
+        {
+            string msgId = js.contains("message_id") ? js["message_id"].get<string>() : "";
+            int ackState = js.contains("ack_state") ? js["ack_state"].get<int>() : -1;
+            if (ackState == ACK_OK)
+            {
+                removePending(msgId); // 服务端已确认，停止重试
+            }
+            else if (ackState == ACK_DEDUP)
+            {
+                // 重复消息被服务端去重，同样移出pending（不需要重试）
+                removePending(msgId);
+                cerr << "[ack] message " << msgId << " was deduped by server" << endl;
+            }
+```
+
+`message_id` 贯穿发送、ACK、重试和接收去重：同一业务消息重发时 id 不变，服务端才能识别重复；`ack_state` 则告诉发送者是已接受、已去重还是处理失败，而不是仅凭 TCP 写成功判断业务成功。
+
+### 片段 27：第 708-732 行
+
+```cpp
+            else
+            {
+                cerr << "[ack] message " << msgId << " failed on server, ack_state=" << ackState << endl;
+            }
+            continue;
+        }
+
+        if (ONE_CHAT_MSG == msgtype)
+        {
+            printOrderedIncoming(js);
+            continue;
+        }
+
+        if (GROUP_CHAT_MSG == msgtype)
+        {
+            printOrderedIncoming(js);
+            continue;
+        }
+
+        // 心跳ACK：标记连接可用
+        if (HEARTBEAT_MSG_ACK == msgtype)
+        {
+            g_heartbeatAcked = true;
+            continue;
+        }
+```
+
+只有已认证连接才能续租自己的在线路由。Redis 条件续期失败可能表示路由已被新会话接管，此时当前连接不应覆盖它；心跳响应回显客户端时间戳，客户端同时获得存活确认和简单 RTT 依据。
+
+### 片段 28：第 733-754 行
+
+```cpp
+
+        if (ERROR_MSG == msgtype)
+        {
+            cerr << "[server] " << js.value("message", string("request rejected"))
+                 << " (code=" << js.value("code", -1) << ")" << endl;
+            continue;
+        }
+
+        if (LOGIN_MSG_ACK == msgtype)
+        {
+            doLoginResponse(js);
+            notifyResponse();
+            continue;
+        }
+
+        if (REG_MSG_ACK == msgtype)
+        {
+            doRegResponse(js);
+            notifyResponse();
+            continue;
+        }
+    }
+```
+
+主线程发送登录/注册后记录响应版本，并在条件变量上等待版本变化。接收线程处理响应后递增版本再唤醒；使用版本谓词可抵抗虚假唤醒，也不会把上一次响应误当成当前请求完成。 这一段把前台登录/注册请求与接收线程响应配对：发送前记录版本，等待被唤醒后再依据共享成功标志进入菜单或继续选择。 这项说明对应第 733-754 行的局部收尾，不代替前后片段的业务含义。
+
+### 片段 29：第 755-786 行
+
+```cpp
+}
+
+// 显示当前登录成功用户的基本信息
+void showCurrentUserData()
+{
+    cout << "======================login user======================" << endl;
+    cout << "current login user => id:" << g_currentUser.getId() << " name:" << g_currentUser.getName() << endl;
+    cout << "----------------------friend list---------------------" << endl;
+    for (User &user : g_currentUserFriendList)
+        cout << user.getId() << " " << user.getName() << " " << user.getState() << endl;
+    cout << "----------------------group list----------------------" << endl;
+    for (Group &group : g_currentUserGroupList)
+    {
+        cout << group.getId() << " " << group.getName() << " " << group.getDesc() << endl;
+        for (GroupUser &user : group.getUsers())
+            cout << user.getId() << " " << user.getName() << " " << user.getState() << " " << user.getRole() << endl;
+    }
+    cout << "======================================================" << endl;
+}
+
+// 获取系统时间
+string getCurrentTime()
+{
+    auto tt = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    struct tm localTime = {};
+    localtime_r(&tt, &localTime);
+    char date[60] = {0};
+    snprintf(date, sizeof(date), "%d-%02d-%02d %02d:%02d:%02d",
+             localTime.tm_year + 1900, localTime.tm_mon + 1, localTime.tm_mday,
+             localTime.tm_hour, localTime.tm_min, localTime.tm_sec);
+    return std::string(date);
+}
+```
+
+SQL 的数值字段按十进制写入，外部字符串则应在前一阶段完成 MySQL 转义。查询列顺序与后面的 row 下标一一对应；一旦调整 SELECT 列表，也必须同步对象装配顺序，避免名称、状态或角色错位。
+
+### 片段 30：第 787-813 行
+
+```cpp
+
+// 命令处理函数声明
+void help(int fd = 0, string str = "");
+void chat(int, string);
+void addfriend(int, string);
+void creategroup(int, string);
+void addgroup(int, string);
+void groupchat(int, string);
+void loginout(int, string);
+
+unordered_map<string, string> commandMap = {
+    {"help", "显示所有支持的命令，格式help"},
+    {"chat", "一对一聊天，格式chat:friendid:message"},
+    {"addfriend", "添加好友，格式addfriend:friendid"},
+    {"creategroup", "创建群组，格式creategroup:groupname:groupdesc"},
+    {"addgroup", "加入群组，格式addgroup:groupid"},
+    {"groupchat", "群聊，格式groupchat:groupid:message"},
+    {"loginout", "注销，格式loginout"}};
+
+unordered_map<string, function<void(int, string)>> commandHandlerMap = {
+    {"help", help},
+    {"chat", chat},
+    {"addfriend", addfriend},
+    {"creategroup", creategroup},
+    {"addgroup", addgroup},
+    {"groupchat", groupchat},
+    {"loginout", loginout}};
+```
+
+菜单把冒号前的命令名映射到处理函数，冒号后的文本保留为参数。关系命令只带目标 id；聊天命令还生成 message_id、会话序号并在发送前登记 pending，确保 ACK 到得很快时也能正确移除待确认项。
+
+### 片段 31：第 814-842 行
+
+```cpp
+
+void mainMenu(int clientfd)
+{
+    help();
+    char buffer[1024] = {0};
+    while (isMainMenuRunning)
+    {
+        cin.getline(buffer, 1024);
+        string commandbuf(buffer);
+        string command;
+        int idx = commandbuf.find(":");
+        if (-1 == idx)
+            command = commandbuf;
+        else
+            command = commandbuf.substr(0, idx);
+        auto it = commandHandlerMap.find(command);
+        if (it == commandHandlerMap.end())
+        { cerr << "invalid input command!" << endl; continue; }
+        it->second(clientfd, commandbuf.substr(idx + 1, commandbuf.size() - idx));
+    }
+}
+
+void help(int, string)
+{
+    cout << "show command list >>> " << endl;
+    for (auto &p : commandMap)
+        cout << p.first << " : " << p.second << endl;
+    cout << endl;
+}
+```
+
+菜单把冒号前的命令名映射到处理函数，冒号后的文本保留为参数。关系命令只带目标 id；聊天命令还生成 message_id、会话序号并在发送前登记 pending，确保 ACK 到得很快时也能正确移除待确认项。 这段继续落实“C++ 命令行客户端”的当前分支，并把已确认结果交给紧接着的状态更新；失败路径不会伪装成成功响应。
+
+### 片段 32：第 843-872 行
+
+```cpp
+
+void addfriend(int clientfd, string str)
+{
+    int friendid = atoi(str.c_str());
+    json js;
+    js["msgid"] = ADD_FRIEND_MSG;
+    js["id"] = g_currentUser.getId();
+    js["friendid"] = friendid;
+    // 帧协议发送
+    if (sendFrame(clientfd, js.dump()) == -1)
+        cerr << "send addfriend msg error" << endl;
+}
+
+void chat(int clientfd, string str)
+{
+    int idx = str.find(":");
+    if (-1 == idx) { cerr << "chat command invalid!" << endl; return; }
+    int friendid = atoi(str.substr(0, idx).c_str());
+    string message = str.substr(idx + 1, str.size() - idx);
+    json js;
+    js["msgid"] = ONE_CHAT_MSG;
+    js["id"] = g_currentUser.getId();
+    js["name"] = g_currentUser.getName();
+    js["toid"] = friendid;
+    js["msg"] = message;
+    js["time"] = getCurrentTime();
+    // 单聊：按目标接收者维度递增序号（toid 独立）
+    js["client_seq"] = nextClientSeqForPeer(friendid);
+    // 携带唯一 message_id，加入 pending 等待ACK
+    string msgId = generateMsgId();
+```
+
+菜单把冒号前的命令名映射到处理函数，冒号后的文本保留为参数。关系命令只带目标 id；聊天命令还生成 message_id、会话序号并在发送前登记 pending，确保 ACK 到得很快时也能正确移除待确认项。 好友命令把当前登录 id 与目标 id 组成请求，不创建 pending，因为关系操作当前协议没有消息 ACK/重试语义。
+
+### 片段 33：第 873-897 行
+
+```cpp
+    js["message_id"] = msgId;
+    string payload = js.dump();
+    addPending(msgId, payload);
+    // 帧协议发送
+    if (sendFrame(clientfd, payload) == -1)
+    {
+        cerr << "send chat msg error" << endl;
+        removePending(msgId); // 发送失败立即移除
+    }
+}
+
+void creategroup(int clientfd, string str)
+{
+    int idx = str.find(":");
+    if (-1 == idx) { cerr << "creategroup command invalid!" << endl; return; }
+    string groupname = str.substr(0, idx);
+    string groupdesc = str.substr(idx + 1, str.size() - idx);
+    json js;
+    js["msgid"] = CREATE_GROUP_MSG;
+    js["id"] = g_currentUser.getId();
+    js["groupname"] = groupname;
+    js["groupdesc"] = groupdesc;
+    if (sendFrame(clientfd, js.dump()) == -1)
+        cerr << "send creategroup msg error" << endl;
+}
+```
+
+这部分完成“C++ 命令行客户端”中的边界分支：无效输入或外部操作失败会在写入后续状态前结束，成功路径才把结果交给相邻模块。这样返回值不仅代表函数结束，还决定上层能否发送成功响应或继续投递。 发送前创建 UUID、递增当前会话序号并立即插入本地消息；随后登记 pending 和发送 payload，用户能即时看到“发送中”，ACK 再更新为已发送。
+
+### 片段 34：第 898-934 行
+
+```cpp
+
+void addgroup(int clientfd, string str)
+{
+    int groupid = atoi(str.c_str());
+    json js;
+    js["msgid"] = ADD_GROUP_MSG;
+    js["id"] = g_currentUser.getId();
+    js["groupid"] = groupid;
+    if (sendFrame(clientfd, js.dump()) == -1)
+        cerr << "send addgroup msg error" << endl;
+}
+
+void groupchat(int clientfd, string str)
+{
+    int idx = str.find(":");
+    if (-1 == idx) { cerr << "groupchat command invalid!" << endl; return; }
+    int groupid = atoi(str.substr(0, idx).c_str());
+    string message = str.substr(idx + 1, str.size() - idx);
+    json js;
+    js["msgid"] = GROUP_CHAT_MSG;
+    js["id"] = g_currentUser.getId();
+    js["name"] = g_currentUser.getName();
+    js["groupid"] = groupid;
+    js["msg"] = message;
+    js["time"] = getCurrentTime();
+    // 群聊：按群组维度递增序号（groupid 独立）
+    js["client_seq"] = nextClientSeqForGroup(groupid);
+    // 携带唯一 message_id
+    string msgId = generateMsgId();
+    js["message_id"] = msgId;
+    string payload = js.dump();
+    addPending(msgId, payload);
+    if (sendFrame(clientfd, payload) == -1)
+    {
+        cerr << "send groupchat msg error" << endl;
+        removePending(msgId);
+    }
+```
+
+菜单把冒号前的命令名映射到处理函数，冒号后的文本保留为参数。关系命令只带目标 id；聊天命令还生成 message_id、会话序号并在发送前登记 pending，确保 ACK 到得很快时也能正确移除待确认项。 群聊以 groupId 作为会话序号维度，生成唯一 message_id 后先登记 pending 再发帧；重试沿用同一 payload，服务端才能幂等。
+
+### 片段 35：第 935-949 行
+
+```cpp
+}
+
+void loginout(int clientfd, string)
+{
+    json js;
+    js["msgid"] = LOGINOUT_MSG;
+    js["id"] = g_currentUser.getId();
+    if (sendFrame(clientfd, js.dump()) == -1)
+        cerr << "send loginout msg error" << endl;
+    else
+    {
+        isMainMenuRunning = false;
+        g_myUserId = 0; // 注销后停止心跳
+    }
+}
+```
+
+这部分完成“C++ 命令行客户端”中的边界分支：无效输入或外部操作失败会在写入后续状态前结束，成功路径才把结果交给相邻模块。这样返回值不仅代表函数结束，还决定上层能否发送成功响应或继续投递。 登出只发送当前连接绑定的用户 id，随后由服务端条件释放节点路由；客户端不应自行伪造 offline 状态代替这次业务清理。
 
 ## 面试重点
 
-重要性高。常见问题：一次 `send/recv` 为什么不够、多个线程写同一 socket 如何防止帧交叉、ACK 丢失为什么不会重复投递、雪花 ID 如何处理时钟回拨、排序为何按会话而不是全局、序号洞为何要超时放行。要准确说明：这套机制提高到“至少一次重试 + 接收端去重”，不等于数学上的绝对不丢；客户端线程均 detach 且用 `exit` 退出，工程化版本还应增加统一生命周期和重连恢复 pending。
+- 能否沿着一条单聊消息说明本地直发、跨节点路由、离线落库、ACK 与重试之间的成功语义？
+
+- Redis 或 RabbitMQ 故障时系统如何降级，哪些保证仍成立，哪些保证会变弱？
+
+- 为什么“至少一次发送 + message_id 幂等”不等于严格 Exactly Once？

@@ -2,59 +2,157 @@
 
 ## 作用概览
 
-这是 MySQL 最小封装的实现，从环境读取连接配置，并为各 Model 提供通用更新、查询和转义所需连接句柄。
+**MySQL 连接封装实现。** 读取数据库环境变量、建立 UTF-8 连接并统一记录错误。模型对象按操作创建该封装，因此失败不会留下未释放的 `MYSQL*`。
 
-## 按学习顺序讲解
+阅读位置：`src/server/db/db.cpp`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-- `MySQL::MySQL()`：调用 `mysql_init(nullptr)` 初始化句柄。
-- `MySQL::~MySQL()`：非空时调用 `mysql_close`。
-- `connect()`：读取 `CHAT_MYSQL_*`，调用 `mysql_real_connect`，成功后设置连接字符集为 `utf8mb4`，失败记录 Muduo 日志。
-- `update(sql)`：执行 SQL；失败记录错误并返回 false。
-- `query(sql)`：执行 SQL 后调用 `mysql_use_result` 返回结果集；失败返回空指针。
-- `getConnection()`：让 Model 使用原始连接执行 `mysql_real_escape_string`。
+## 代码片段与详细讲解
 
-## 函数详细说明
+### 片段 1：第 1-26 行
 
-### `MySQL::MySQL()`
+```cpp
+#include "db.h"
+#include "config.hpp"
+#include <muduo/base/Logging.h>
 
-构造函数调用 `mysql_init(nullptr)` 初始化 MySQL C API 连接句柄，并保存到 `_conn`。这一步只是在本地准备连接对象，还没有真正连到数据库。
+/**
+ * @brief 创建一个 MySQL C API 连接句柄。
+ *
+ * mysql_init 只初始化本地句柄，真正的 TCP 连接由 connect() 建立。
+ * 每个 Model 方法都在栈上创建 MySQL 对象，因此句柄不在多线程之间共享。
+ */
+MySQL::MySQL()
+{
+    _conn = mysql_init(nullptr);
+}
 
-如果初始化失败，`_conn` 可能为空。后续 `connect()` 调用依赖这个句柄，因此工程化版本可以在构造后检查空指针并把错误向上返回。当前项目保持简单封装，由后续连接失败日志体现问题。
+/**
+ * @brief 释放连接句柄，保证所有早退路径都不泄漏数据库资源。
+ *
+ * Model 层依赖 RAII：无论 SQL 成功还是失败，函数返回时析构函数都会
+ * 执行 mysql_close。
+ */
+MySQL::~MySQL()
+{
+    if (_conn != nullptr)
+        mysql_close(_conn);
+}
+```
 
-### `MySQL::~MySQL()`
+这些头文件把“MySQL 连接封装实现”接到项目公共协议、领域对象和所需系统库。依赖方向保持从实现到接口：模型不知道网络连接，帧工具不知道用户业务，当前文件负责在自己的层内组合它们。
 
-析构函数负责释放数据库连接。只要 `_conn` 非空，就调用 `mysql_close(_conn)`。因为各个 Model 通常在函数内部创建局部 `MySQL mysql;`，所以函数结束时析构会自动关闭连接。
+### 片段 2：第 27-48 行
 
-这个设计好理解，但每次数据库操作都新建连接，性能上不适合高并发。面试时可以说明后续应引入连接池，把“每请求建连”改成“从池中借还连接”。
+```cpp
 
-### `connect()`
+/**
+ * @brief 根据环境变量建立数据库连接。
+ * @return 连接成功返回 true，否则记录目标主机和 MySQL 错误并返回 false。
+ *
+ * 配置优先从 CHAT_MYSQL_* 环境变量读取，未设置时使用本地开发默认值。
+ * 连接成功后设置 utf8mb4，以完整保存中文和 emoji，避免聊天内容乱码。
+ */
+bool MySQL::connect()
+{
+    const string server = chatserver::config::envOr("CHAT_MYSQL_HOST", "127.0.0.1");
+    const string user = chatserver::config::envOr("CHAT_MYSQL_USER", "root");
+    const string password = chatserver::config::envOr("CHAT_MYSQL_PASSWORD", "123456");
+    const string dbname = chatserver::config::envOr("CHAT_MYSQL_DATABASE", "chat");
+    const int port = chatserver::config::envIntOr("CHAT_MYSQL_PORT", 3306);
 
-该函数读取 `CHAT_MYSQL_HOST`、`CHAT_MYSQL_USER`、`CHAT_MYSQL_PASSWORD`、`CHAT_MYSQL_DATABASE`、`CHAT_MYSQL_PORT` 等环境变量，没有配置时使用默认值。随后调用 `mysql_real_connect` 建立实际 TCP 连接和数据库会话。
+    MYSQL *p = mysql_real_connect(_conn, server.c_str(), user.c_str(),
+                                  password.c_str(), dbname.c_str(), port, nullptr, 0);
+    if (p != nullptr)
+    {
+        mysql_set_character_set(_conn, "utf8mb4");
+    }
+```
 
-连接成功后会设置字符集为 `utf8mb4`，这一步很重要：聊天内容、昵称、群描述可能包含中文或 emoji，如果字符集不一致，可能写入乱码或截断。连接失败时不会打印密码，只记录 host、port、database 和错误原因。
+每个模型操作创建连接后在这里读取环境配置并连接数据库。连接成功才设置 utf8mb4；失败返回 false，调用方不会继续执行 SQL，析构函数仍可安全释放初始化过的句柄。
 
-返回值是布尔语义：成功返回非空指针转换后的 true，失败返回 false。调用方必须先判断 `connect()`，再执行 `update/query` 或 `mysql_real_escape_string`。
+连接参数来自 CHAT_MYSQL_* 环境变量，`mysql_real_connect` 成功后把字符集设为 utf8mb4，保证中文和表情在转义、写入、读出时使用一致字节解释。失败时保留错误日志，模型操作返回失败而不是解引用空连接。
 
-### `update(sql)`
+本片段读取 `CHAT_MYSQL_HOST`、`CHAT_MYSQL_USER`、`CHAT_MYSQL_PASSWORD`、`CHAT_MYSQL_DATABASE`、`CHAT_MYSQL_PORT`。未设置时采用紧邻的本机默认值；容器部署则覆盖这些值，因此同一二进制可以作为不同节点运行，无需重新编译。
 
-这个函数执行写操作或不需要结果集的 SQL，例如 insert、update、delete。参数 `sql` 是已经组装好的 SQL 字符串。
+### 片段 3：第 49-73 行
 
-内部调用 `mysql_query`，失败时记录 `mysql_error(_conn)` 并返回 false。日志刻意不打印完整 SQL，因为 SQL 中可能包含密码哈希或聊天内容，直接打印会造成敏感信息泄漏。
+```cpp
+    else
+    {
+        LOG_ERROR << "connect mysql failed: " << mysql_error(_conn)
+                  << " host=" << server << ":" << port
+                  << " database=" << dbname;
+    }
 
-成功返回 true。调用方通常据此决定是否给客户端返回成功，例如注册、创建群、离线消息落库都依赖这个结果。
+    return p;
+}
 
-### `query(sql)`
+/**
+ * @brief 执行不需要返回结果集的 SQL，如 INSERT/UPDATE/DELETE。
+ * @param sql 已由上层按字段类型组装并对字符串进行转义的 SQL。
+ * @return mysql_query 执行成功返回 true。
+ *
+ * 错误日志故意不输出完整 SQL，因为 SQL 可能包含密码哈希或聊天正文。
+ */
+bool MySQL::update(string sql)
+{
+    if (mysql_query(_conn, sql.c_str()))
+    {
+        // 不打印完整 SQL，避免把密码哈希或聊天内容写入日志。
+        LOG_ERROR << "mysql update failed: " << mysql_error(_conn);
+        return false;
+    }
+```
 
-这个函数执行查询 SQL，并返回 `MYSQL_RES*` 结果集。内部同样用 `mysql_query` 发送 SQL，如果失败则记录错误并返回 `nullptr`。
+更新接口执行不产生结果集的 SQL，并把 MySQL 错误记录出来。返回布尔值会一路传到注册、登录状态和离线消息逻辑，决定是否可以向客户端承诺成功。
 
-查询成功后调用 `mysql_use_result(_conn)`，这是流式读取结果的方式。优点是内存占用较低，缺点是必须尽快把结果读完并 `mysql_free_result`，否则该连接不能继续执行下一条 SQL。当前项目每个查询都在同一函数内读取并释放，符合这个约束。
+### 片段 4：第 74-100 行
 
-### `getConnection()`
+```cpp
 
-这个函数把底层 `MYSQL*` 暴露给 Model，主要用途是调用 `mysql_real_escape_string` 和 `mysql_insert_id`。例如注册时需要转义昵称和密码哈希，创建群后需要取自增群 ID。
+    return true;
+}
 
-它让封装变得不那么纯粹，但减少了重新包装 MySQL C API 的代码。面试时可以说明：更规范的做法是继续封装“转义字符串”“获取自增 ID”“预编译语句”等能力，避免上层直接依赖底层连接。
+/**
+ * @brief 执行 SELECT 并返回流式结果集。
+ * @return 成功时返回 mysql_use_result 的 MYSQL_RES*，失败返回 nullptr。
+ *
+ * mysql_use_result 不会一次性把整个结果集搬入内存，但调用方必须完整读取并
+ * mysql_free_result，且在释放前不能在同一连接上发送新查询。
+ */
+MYSQL_RES *MySQL::query(string sql)
+{
+    if (mysql_query(_conn, sql.c_str()))
+    {
+        LOG_ERROR << "mysql query failed: " << mysql_error(_conn);
+        return nullptr;
+    }
+
+    return mysql_use_result(_conn);
+}
+
+/**
+ * @brief 暴露当前 MYSQL 句柄，供字符串转义和获取自增主键使用。
+ *
+ * 返回值的生命周期不超过当前 MySQL 对象，调用方不应缓存该指针。
+ */
+```
+
+这部分完成“MySQL 连接封装实现”中的边界分支：无效输入或外部操作失败会在写入后续状态前结束，成功路径才把结果交给相邻模块。这样返回值不仅代表函数结束，还决定上层能否发送成功响应或继续投递。
+
+### 片段 5：第 101-104 行
+
+```cpp
+MYSQL* MySQL::getConnection()
+{
+    return _conn;
+}
+```
+
+这部分完成“MySQL 连接封装实现”中的边界分支：无效输入或外部操作失败会在写入后续状态前结束，成功路径才把结果交给相邻模块。这样返回值不仅代表函数结束，还决定上层能否发送成功响应或继续投递。 这段继续落实“MySQL 连接封装实现”的当前分支，并把已确认结果交给紧接着的状态更新；失败路径不会伪装成成功响应。
 
 ## 面试重点
 
-重要性中等。常见问题：`mysql_use_result` 与 `mysql_store_result` 区别？前者流式、内存低但占用连接直到读完；当前每请求连接的成本如何优化？使用连接池；为何仍推荐预编译语句？比手工转义更安全并可复用执行计划。
+- 领域对象与数据访问层如何分工，业务层为什么不直接拼 SQL？
+
+- 当前转义拼接、双向好友写入或群成员 N+1 查询有哪些一致性与性能改进空间？

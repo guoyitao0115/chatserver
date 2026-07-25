@@ -2,42 +2,171 @@
 
 ## 作用概览
 
-该实现完成离线消息的安全插入、按序查询和消费后删除。
+**离线消息数据访问实现。** 把完整 JSON 文本转义后写入数据库，登录时按自增 id 读取以保持同一用户的落库顺序，再在业务层确认已装入登录响应后删除。
 
-## 按学习顺序讲解
+阅读位置：`src/server/model/offlinemessagemodel.cpp`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-- `insert(userid,msg)`：连接数据库，按消息长度申请最多两倍加一的缓冲，使用 `mysql_real_escape_string` 处理引号、反斜杠和换行，再插入并返回真实结果。
-- `remove(userid)`：删除用户的全部离线消息；失败写日志。
-- `query(userid)`：以 `ORDER BY id ASC` 查询，按结果字段的真实长度构造字符串，避免把 JSON 内嵌空字节或长文本截断，并释放结果集。
+## 代码片段与详细讲解
 
-## 函数详细说明
+### 片段 1：第 1-28 行
 
-### `OfflineMsgModel::insert(userid, msg)`
+```cpp
+#include "offlinemessagemodel.hpp"
+#include "db.h"
+#include <muduo/base/Logging.h>
+#include <cstring>
+using namespace muduo;
 
-这个函数把离线消息写入 `offlinemessage` 表。`userid` 是接收者，`msg` 是完整消息 JSON 字符串。它通常只在实时投递失败后调用，是消息可靠性的最后兜底。
+// 离线消息模型是投递链路的最后一道可靠性兜底：本地连接不存在、
+// 跨节点路由缺失或 RabbitMQ 发布失败时，ChatService 会把原始 JSON 写入此表。
 
-实现第一步连接数据库。连接失败时会记录 `userid`，并返回 false，让上层知道消息没有保存成功。这里不能静默失败，否则发送端收到成功 ACK 后消息却不存在，会形成真实丢失。
+/**
+ * @brief 按用户 ID 持久化一条完整聊天消息。
+ * @param userid 最终接收者 ID。
+ * @param msg 待恢复投递的 JSON 字符串，上线后会原样返回客户端。
+ * @return 只有数据库连接和 INSERT 都成功时返回 true。
+ *
+ * 转义缓冲区按 2*n+1 分配，避免固定长度数组截断长消息。
+ * mysql_real_escape_string 使用已连接句柄，会按当前字符集正确处理特殊字符。
+ * 失败日志会带 userid，但不记录消息正文，以减少隐私泄漏。
+ */
+bool OfflineMsgModel::insert(int userid, string msg)
+{
+    MySQL mysql;
+    if (!mysql.connect())
+    {
+        LOG_ERROR << "[OfflineMsgModel::insert] connect DB failed, userid="
+                  << userid << " msg dropped!";
+        return false;
+    }
+```
 
-连接成功后，函数按消息长度申请 `msg.size() * 2 + 1` 的转义缓冲区，并使用 `mysql_real_escape_string` 处理聊天内容中可能出现的单引号、反斜杠、换行等字符。随后动态拼接 SQL，避免旧式固定 4KB 缓冲导致长消息被截断。
+离线消息保存完整 JSON 字符串而非拆字段，新增协议字段无需修改表结构。正文按连接字符集转义后插入，返回值直接决定 ChatService 能否回复 ACK_OK。
 
-返回值是落库结果。业务层应基于它决定 ACK：只有消息被直接发送、跨节点发布成功或离线落库成功，才适合返回成功确认。
+### 片段 2：第 29-52 行
 
-### `OfflineMsgModel::remove(userid)`
+```cpp
 
-这个函数删除某个用户的全部离线消息。它一般发生在登录响应已经装入离线消息之后，目的是避免下次登录重复收到同一批消息。
+    // 对消息内容做转义，防止消息中含有单引号/反斜杠破坏 SQL 结构
+    // mysql_real_escape_string 需要已建立的连接句柄
+    size_t msgLen = msg.size();
+    // 转义后最长为原来2倍+1
+    vector<char> escaped(msgLen * 2 + 1);
+    mysql_real_escape_string(mysql.getConnection(),
+                             escaped.data(),
+                             msg.c_str(),
+                             (unsigned long)msgLen);
 
-实现上使用 `DELETE FROM offlinemessage WHERE userid=%d`，连接失败或删除失败都会记录日志。函数返回 `void`，所以业务层不会因为删除失败中断登录流程。
+    // 动态组装，避免固定 4KB 缓冲区截断较长消息。
+    string sql = "INSERT INTO offlinemessage(userid, message) VALUES(";
+    sql += to_string(userid);
+    sql += ", '";
+    sql += escaped.data();
+    sql += "')";
 
-面试时要讲清楚：这个“查出后删除”的方案简单，但不是严格可靠消费。如果删除成功后响应丢失，客户端可能没收到消息；如果删除失败，客户端下次可能重复收到。更可靠的方案是消息状态机加客户端 ACK。
+    if (!mysql.update(sql))
+    {
+        // 落库失败必须记录错误日志，不能静默丢弃
+        LOG_ERROR << "[OfflineMsgModel::insert] insert failed, userid=" << userid;
+        return false;
+    }
+```
 
-### `OfflineMsgModel::query(userid)`
+动态字符串先按当前 MySQL 连接的字符集执行转义，再拼入 SQL。例如名称含单引号时会作为字段内容保存，而不是提前结束字符串字面量；数值 id 则直接以十进制拼接。更大项目宜进一步改为预处理语句。
 
-这个函数按用户 ID 查询离线消息。SQL 使用 `ORDER BY id ASC`，保证同一用户的离线消息按数据库插入顺序返回，这比按客户端时间更稳定，因为客户端时间可能不准。
+这部分处在离线恢复链路：在线路由不可用时保存完整消息，用户登录时按落库顺序装入响应。当前“读取后删除”是一次性交付语义；若发送登录响应前后进程崩溃，客户端仍应依靠 message_id 去重。
 
-实现流程是连接数据库、执行查询、循环读取 `message` 字段并 push 到 `vector<string>`。读取后释放结果集，最后返回消息列表。
+### 片段 3：第 53-76 行
 
-当前实现把每条消息作为完整 JSON 字符串返回，让业务层不需要理解离线表结构。缺点是后续如果要按消息 ID、会话、时间范围分页查询，会需要新增字段或拆表结构。
+```cpp
+    return true;
+}
+
+/**
+ * @brief 删除用户当前全部离线消息。
+ *
+ * 登录响应已组装完离线消息后调用此函数。当前是“先读取、再删除、
+ * 再发送”的简化语义：删除失败可能导致下次重复投递，因此客户端仍需去重；
+ * 而删除后、响应到达前进程崩溃，则仍存在丢失窗口。
+ */
+void OfflineMsgModel::remove(int userid)
+{
+    char sql[256] = {0};
+    snprintf(sql, sizeof(sql),
+             "DELETE FROM offlinemessage WHERE userid=%d", userid);
+
+    MySQL mysql;
+    if (mysql.connect())
+    {
+        if (!mysql.update(sql))
+        {
+            // 删除失败只记录警告，不影响业务流程
+            LOG_ERROR << "[OfflineMsgModel::remove] delete failed, userid=" << userid;
+        }
+```
+
+登录响应已经装入离线消息后按 userId 删除。正常二次登录不会重放；但响应发送与删除不在事务/确认协议中，极端崩溃窗口仍需要客户端 message_id 去重。
+
+### 片段 4：第 77-109 行
+
+```cpp
+    }
+    else
+    {
+        LOG_ERROR << "[OfflineMsgModel::remove] connect DB failed, userid=" << userid;
+    }
+}
+
+/**
+ * @brief 按入库顺序取出用户的所有离线消息。
+ * @return 消息 JSON 字符串列表；查询失败时返回空列表。
+ *
+ * ORDER BY id ASC 使结果按自增主键顺序恢复，保留单库写入的先后关系。
+ * 每行的 message 被复制到 vector 后即可释放 MYSQL_RES。
+ */
+vector<string> OfflineMsgModel::query(int userid)
+{
+    char sql[256] = {0};
+    snprintf(sql, sizeof(sql),
+             "SELECT message FROM offlinemessage WHERE userid = %d ORDER BY id ASC", userid);
+
+    vector<string> vec;
+    MySQL mysql;
+    if (mysql.connect())
+    {
+        MYSQL_RES *res = mysql.query(sql);
+        if (res != nullptr)
+        {
+            // 把userid用户的所有离线消息放入vec中返回
+            MYSQL_ROW row;
+            while ((row = mysql_fetch_row(res)) != nullptr)
+            {
+                vec.push_back(row[0]);
+            }
+```
+
+查询按自增 `id` 升序读取完整 JSON，返回顺序就是登录恢复顺序。业务层再依据消息内 `client_seq` 展示；这里不解析 JSON，避免数据访问层耦合协议字段。
+
+查询成功后逐行读取结果集，把 SQL 列转换为领域对象或字符串集合。代码只在结果非空时访问列，并在结束后释放结果集；返回空集合既可能表示没有数据，也可能伴随日志中的查询失败，需要上层结合语义处理。
+
+### 片段 5：第 110-118 行
+
+```cpp
+            mysql_free_result(res);
+        }
+    }
+    else
+    {
+        LOG_ERROR << "[OfflineMsgModel::query] connect DB failed, userid=" << userid;
+    }
+    return vec;
+}
+```
+
+结果集在所有行转换完成后立即释放，再返回已经拥有自身字符串/数值副本的容器。这样后续 SQL 可以复用连接，也不会让领域对象持有指向 MYSQL_RES 内部缓冲的悬空指针。
 
 ## 面试重点
 
-重要性高。常见问题：特殊字符为何不会破坏 SQL、为什么按 `id` 而不是客户端时间排序、拉取后删除如何改为可靠消费。还需注意无连接池及整批删除在大量离线消息时的扩展性。
+- 当前 SQL 如何避免字符串破坏语句，为什么预处理语句仍是更好的演进方向？
+
+- 离线消息按什么顺序恢复，“读取后删除”在哪些崩溃窗口可能重复或遗漏？

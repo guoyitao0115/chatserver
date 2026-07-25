@@ -2,50 +2,116 @@
 
 ## 作用概览
 
-该头文件定义客户端与服务端共用的 TCP 应用层帧协议：4 字节网络序长度头加 JSON 负载。它只依赖标准库和 socket 字节序函数，因此核心协议可以独立单元测试。
+**公共长度帧协议。** 提供不依赖 Muduo 的 4 字节大端长度头编码、解码和阻塞式收发工具，主要供命令行客户端和核心测试复用。
 
-## 按学习顺序讲解
+阅读位置：`include/frameprotocol.hpp`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-### 常量
+## 代码片段与详细讲解
 
-`FRAME_HEADER_LEN=4` 固定头长；`FRAME_MAX_PAYLOAD=4 MiB` 限制单帧大小，避免异常长度触发过度分配。
+### 片段 1：第 1-37 行
 
-### `encodeFrame(payload)`
+```cpp
+#ifndef FRAMEPROTOCOL_HPP
+#define FRAMEPROTOCOL_HPP
 
-先拒绝空负载和超大负载，再用 `htonl` 把长度转为网络字节序，最后拼接长度头与原始字节。返回值可以直接交给 socket/Muduo 发送。
+#include <arpa/inet.h>
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
+#include <string>
 
-### `decodeFrameLength(header)`
+namespace chatserver
+{
+namespace protocol
+{
 
-使用 `memcpy` 读取可能未对齐的 4 字节，再用 `ntohl` 恢复主机序长度。避免直接强转指针带来的对齐和别名问题。
+// 线上的帧头固定占 4 字节，保存无符号 32 位 payload 长度（网络字节序）。
+// 固定长度头使接收端无需扫描分隔符，也能在 TCP 字节流中准确识别消息边界。
+constexpr std::size_t FRAME_HEADER_LEN = 4;
 
-### `isValidPayloadLength(payloadLen)`
+// 单帧业务负载上限为 4 MiB。该限制是协议的一部分：客户端和服务端必须一致，
+// 用于阻止伪造长度头导致接收端无限等待或分配过大内存。
+constexpr std::uint32_t FRAME_MAX_PAYLOAD = 4U * 1024U * 1024U;
 
-集中判断长度必须处于 `(0, 4 MiB]`，使客户端与服务端使用同一边界规则。
+/**
+ * 将一段完整业务负载编码为可直接写入 TCP 的长度前缀帧。
+ *
+ * @param payload 通常是序列化后的 JSON；必须非空且不超过 FRAME_MAX_PAYLOAD。
+ * @return 由“4 字节网络序长度头 + 原始 payload 字节”组成的新字符串。
+ * @throws std::length_error 当 payload 为空或超过协议上限时抛出；调用方不应发送
+ *         该消息。函数不执行网络 I/O，也不会修改传入字符串。
+ *
+ * 先 reserve 再 append，可避免构造大消息时发生多次扩容。长度转换为 uint32_t 前
+ * 已经过上限校验，因此不会发生 size_t 截断。
+ */
+inline std::string encodeFrame(const std::string &payload)
+{
+    if (payload.empty() || payload.size() > FRAME_MAX_PAYLOAD)
+    {
+```
 
-## 函数详细说明
+这些头文件把“公共长度帧协议”接到项目公共协议、领域对象和所需系统库。依赖方向保持从实现到接口：模型不知道网络连接，帧工具不知道用户业务，当前文件负责在自己的层内组合它们。
 
-### `encodeFrame(const std::string &payload)`
+### 片段 2：第 38-63 行
 
-- **输入**：未经编码的业务负载，项目中通常是 `json.dump()` 的 UTF-8 字符串。函数不关心 JSON 内容，只关心字节长度。
-- **返回**：新的二进制字符串，前 4 字节是 payload 长度，后面是原始 payload；调用方可以一次性交给 `send` 或 Muduo 的 `conn->send`。
-- **执行过程**：先判断 payload 非空且不超过 4 MiB；再把 `size()` 转成 32 位整数并通过 `htonl` 转为大端；`reserve` 一次性预留总容量，随后追加帧头和正文，减少扩容复制。
-- **异常与边界**：长度不合法时抛出 `std::length_error`。它只负责生成完整帧，不保证一次系统调用就能把全部字节发出，命令行客户端仍需要循环 `send`。
-- **调用关系**：`FrameCodec::encode` 和命令行客户端 `sendFrame` 都复用它，从源头避免两端协议实现漂移。
+```cpp
+        throw std::length_error("chat frame payload size is invalid");
+    }
 
-### `decodeFrameLength(const char *header)`
+    const std::uint32_t netLen = htonl(static_cast<std::uint32_t>(payload.size()));
+    std::string frame;
+    frame.reserve(FRAME_HEADER_LEN + payload.size());
+    frame.append(reinterpret_cast<const char *>(&netLen), FRAME_HEADER_LEN);
+    frame.append(payload);
+    return frame;
+}
 
-- **输入**：至少指向 4 个可读字节的地址，调用者必须先确认缓冲区长度。
-- **返回**：主机字节序的无符号 32 位 payload 长度。
-- **执行过程**：先 `memcpy` 到局部变量，再用 `ntohl` 转换。没有直接写成 `*reinterpret_cast<uint32_t*>(header)`，是为了避免未对齐访问和严格别名问题。
-- **边界**：该函数只解码，不判断 0 或超大长度；调用方必须继续调用 `isValidPayloadLength`。
+/**
+ * 从 4 字节帧头读取 payload 长度并转换为主机字节序。
+ *
+ * @param header 至少指向 FRAME_HEADER_LEN 个可读字节；其有效性和生命周期由调用方
+ *        保证，函数不会检查空指针或缓冲区长度。
+ * @return 帧头声明的负载字节数。该结果仍需交给 isValidPayloadLength() 校验。
+ *
+ * 使用 memcpy 而非直接将 char* 强转为 uint32_t*，避免未对齐访问和严格别名问题。
+ */
+inline std::uint32_t decodeFrameLength(const char *header)
+{
+    std::uint32_t netLen = 0;
+    std::memcpy(&netLen, header, FRAME_HEADER_LEN);
+    return ntohl(netLen);
+}
+```
 
-### `isValidPayloadLength(std::uint32_t payloadLen)`
+写出数据前补上 4 字节大端长度头，接收方因此能从连续 TCP 字节中判断一条 JSON 到哪里结束。例如两条消息合并到一次读取时，会按各自长度连续拆出，而不会把两个 JSON 拼成坏数据。
 
-- **输入/返回**：输入解码后的长度；只有 1～4 MiB 返回 true。
-- **作用**：把安全边界集中到公共协议层，网关、客户端、服务端不会各自使用不同上限。
-- **边界含义**：拒绝 0 可避免解码循环在空帧上无进展；限制最大值可降低恶意长度头导致的内存与连接占用风险。
+读取先确认长度头完整，再判断正文是否已经收齐；不足时保留 Buffer 原状等待下一批字节。只有长度合法且正文完整才前移读指针，这同时处理了半包和一次到达多帧的粘包情况。
 
+### 片段 3：第 64-77 行
+
+```cpp
+
+/**
+ * 判断长度是否属于当前协议允许的业务负载范围。
+ * 空帧被视为协议错误；超过上限的帧应由连接层立即拒绝，不能继续等待其 body。
+ */
+inline bool isValidPayloadLength(std::uint32_t payloadLen)
+{
+    return payloadLen > 0 && payloadLen <= FRAME_MAX_PAYLOAD;
+}
+
+} // namespace protocol
+} // namespace chatserver
+
+#endif
+```
+
+这一接口片段规定“公共长度帧协议”对外可用的操作和对象必须长期保存的状态。调用者只依赖这里的契约；锁、SQL、网络错误和资源释放留在实现内部，因此更换基础设施不会迫使业务处理器改写所有调用点。
 
 ## 面试重点
 
-重要性高。常见问题：为什么 TCP 需要应用层帧？TCP 是字节流，没有消息边界；为什么长度头用网络序？跨端字节序一致；如何处理粘包/半包？缓存不足一帧的数据，完整后再消费。
+- TCP 为什么必须自行处理半包和粘包，4 字节长度头如何完成增量解码？
+
+- WebSocket 帧与后端 TCP 长度帧的边界分别在哪里，网关为什么不能承担最终鉴权？
+
+- 最大帧长、半包超时和空闲超时各自防什么问题？

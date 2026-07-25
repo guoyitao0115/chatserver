@@ -2,35 +2,66 @@
 
 ## 作用概览
 
-该接口集中提供 bcrypt 密码哈希和校验，业务层永远不需要了解盐格式或 `crypt_r` 细节。
+**密码哈希接口。** 限定注册和历史密码迁移只能通过 bcrypt 生成摘要，并提供基于已有摘要的校验入口，避免业务层接触 salt 格式细节。
 
-## 按学习顺序讲解
+阅读位置：`include/server/security/password_hasher.hpp`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-- `hashBcrypt(plain, rounds)`：生成随机盐并计算带算法、cost 和盐的完整 bcrypt 字符串；默认 cost 12。
-- `verifyBcrypt(plain, storedHash)`：使用存储哈希中的算法/盐重新计算并比较。
-- `generateBcryptSalt(rounds)`：私有辅助函数，规范 cost 并生成 `$2b$cc$...` 格式盐。
+## 代码片段与详细讲解
 
-## 函数详细说明
+### 片段 1：第 1-24 行
 
-### `static string hashBcrypt(const string &plain, int rounds)`
+```cpp
+#ifndef PASSWORD_HASHER_H
+#define PASSWORD_HASHER_H
 
-- **输入**：明文密码和 cost；业务层在调用前限制 6～72 字节。
-- **流程**：调用私有盐生成函数，再用 `crypt_r` 计算完整 bcrypt 字符串。
-- **返回**：成功返回包含版本、cost、盐和摘要的字符串；底层失败返回空串，注册函数据此拒绝写库。
-- **副作用**：不修改输入，也不保存全局盐；每次调用都应产生不同哈希。
+#include <string>
 
-### `static bool verifyBcrypt(const string &plain, const string &storedHash)`
+using std::string;
 
-- 空存储值直接 false。
-- 把完整存储哈希作为 `crypt_r` 的 salt 参数，底层自动读取版本、cost 和盐，重算后比较。
-- 返回 true 只代表密码匹配，不做用户状态检查。
-- 当前字符串比较不是严格恒定时间；在更高安全要求下应使用恒定时间比较函数。
+/**
+ * bcrypt 密码哈希工具。
+ *
+ * 输出包含算法版本、成本因子和随机盐，可直接存入 user.password。该类无状态，公开
+ * 方法使用 crypt_r 的线程局部工作区，适合多 I/O 线程并发调用。接口以空字符串/
+ * false 表示底层 crypt 失败；调用方不得在失败时退回明文存储。
+ */
+class PasswordHasher
+{
+public:
+    /**
+     * 为明文生成带随机盐的 bcrypt 哈希。
+     * rounds 会被规范到 [4,31]；默认 12 在安全性和登录耗时之间取平衡。bcrypt 只
+     * 使用密码前 72 字节，业务注册层必须限制长度，避免不同长密码得到相同有效输入。
+     * @return 成功时为完整哈希，crypt_r 失败时为空字符串。
+     */
+    static string hashBcrypt(const string &plain, int rounds = 12);
+```
 
-### `static string generateBcryptSalt(int rounds)`
+这里固定模块需要长期保存的状态。这些成员把跨回调信息留在对象生命周期内；实现文件中的锁和清理逻辑必须围绕它们保持一致。
 
-私有函数先把 cost 归一到 4～31，再生成 22 字符随机盐，格式化为 `$2b$cc$<salt>`。只有哈希函数能调用它，避免业务层自己拼装不合法盐。
+### 片段 2：第 25-38 行
 
+```cpp
+
+    /**
+     * 使用 storedHash 自带的版本、成本和盐重新计算后比较结果。
+     * 空哈希、格式不受支持或 crypt_r 失败均返回 false。不要把该返回值用于区分
+     * “用户不存在”和“密码错误”，以免认证响应泄露账号存在性。
+     */
+    static bool verifyBcrypt(const string &plain, const string &storedHash);
+
+private:
+    // 生成 "$2b$<cost>$<22字符盐>"；只供 hashBcrypt 使用，不是最终密码哈希。
+    static string generateBcryptSalt(int rounds);
+};
+
+#endif
+```
+
+这一接口片段规定“密码哈希接口”对外可用的操作和对象必须长期保存的状态。调用者只依赖这里的契约；锁、SQL、网络错误和资源释放留在实现内部，因此更换基础设施不会迫使业务处理器改写所有调用点。
 
 ## 面试重点
 
-重要性高。可能问题：为什么不能存明文或普通 SHA？密码哈希需要随机盐和可调成本抵御彩虹表与暴力破解；bcrypt 为什么限制密码长度？有效输入上限通常为 72 字节，本项目注册也做了对应限制。
+- 这个文件处于哪一层，它保存的数据由谁创建、由谁消费？
+
+- 如果删除或修改本文件，最先受影响的运行链路是什么？

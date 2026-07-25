@@ -2,49 +2,47 @@
 
 ## 作用概览
 
-该接口集中定义群及群成员的数据库访问能力。
+**群组数据访问接口。** 定义建群、入群、查询用户群列表和查询消息接收成员，分别服务于登录数据装载和群聊扇出。
 
-## 按学习顺序讲解
+阅读位置：`include/server/model/groupmodel.hpp`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-- `createGroup(group)`：插入群资料，并把数据库自增 ID 回填到对象。
-- `addGroup(userid, groupid, role)`：写入群成员及角色。
-- `queryGroups(userid)`：先查询用户加入的群，再查询每个群的成员详情，组装成 `vector<Group>`。
-- `queryGroupUsers(userid, groupid)`：返回群内除发送者外的用户 ID，供群发循环使用。
+## 代码片段与详细讲解
 
-## 函数详细说明
+### 片段 1：第 1-26 行
 
-### `createGroup(group)`
+```cpp
+#ifndef GROUPMODEL_H
+#define GROUPMODEL_H
 
-这个函数负责创建群资料。参数是一个 `Group&`，用引用传入是因为函数不仅要读取群名称和描述，还要在插入成功后把数据库生成的群 ID 回填到同一个对象里。
+#include "group.hpp"
+#include <string>
+#include <vector>
+using namespace std;
 
-执行流程上，函数会插入 `AllGroup` 表，然后查询或读取自增 ID，并调用 `group.setId(...)`。返回值表示创建群资料是否成功。业务层收到成功后，才会继续调用 `addGroup(userid, groupid, "creator")` 把创建者加入群。
+// GroupModel 封装 allgroup/groupuser 两张表，是群创建、入群、群聊路由的数据库边界。
+class GroupModel
+{
+public:
+    // 创建群组并把生成的 group.id 回填到传入对象，便于业务层随后把创建者加入 groupuser。
+    bool createGroup(Group &group);
 
-这里最重要的边界点是事务一致性：创建群和加入创建者是两个动作，如果创建群成功但加入创建者失败，就会出现“空群”或“创建者不在群里”。项目当前实现偏教学和面试演示，严格生产方案应该把两步放入事务。
+    // 加入群组。role 由业务层传入，创建者通常为 creator，普通成员为 normal。
+    void addGroup(int userid, int groupid, string role);
 
-### `addGroup(userid, groupid, role)`
+    // 查询用户所在的群组，并组装每个群中的成员信息，用于登录时返回完整群列表。
+    vector<Group> queryGroups(int userid);
 
-这个函数把用户加入指定群，并记录角色。`userid` 是成员用户 ID，`groupid` 是目标群 ID，`role` 通常是 `creator` 或 `normal`。
+    // 查询指定群除发送者外的成员 id。群聊发送时业务层遍历这个列表逐个投递或存离线。
+    vector<int> queryGroupUsers(int userid, int groupid);
+};
 
-它的调用场景有两个：创建群成功后把创建者加入群；普通用户主动加入已有群。函数本身不返回值，意味着当前业务层没有根据插入失败做精细反馈，这一点可以作为后续优化点。
+#endif
+```
 
-执行流程本质上是插入 `GroupUser` 表。面试时可以补充：如果担心重复加入，应增加唯一索引 `(groupid, userid)`，并在业务层处理重复键错误。
-
-### `queryGroups(userid)`
-
-这个函数查询某个用户加入的所有群，并组装每个群的成员信息。它常在登录成功时执行，结果会放入登录响应，客户端据此渲染群列表。
-
-执行流程分两层：第一层先查出该用户所在的群，包括群 ID、群名、群描述和该用户在群里的角色；第二层对每个群继续查询群成员，把成员 ID、昵称、状态、角色封装成 `GroupUser`，追加到对应 `Group` 的成员列表里。
-
-返回值是 `vector<Group>`，每个 `Group` 内部又带 `vector<GroupUser>`。这个结构适合客户端一次性拿到初始会话数据，但也带来一个面试常问点：如果用户加入很多群，当前写法会产生 N+1 查询。优化方案是一次 JOIN 拉平数据，再按 group ID 在内存中聚合。
-
-### `queryGroupUsers(userid, groupid)`
-
-这个函数服务于群聊转发。`userid` 是发送者，`groupid` 是目标群。返回值是群内除发送者之外的用户 ID 列表。
-
-业务层 `ChatService::groupChat` 拿到这个列表后，会逐个判断用户是否在线、是否在本节点、是否需要走 RabbitMQ，最后无法实时投递时写入离线消息。也就是说，这个函数只负责“群里有哪些接收者”，不负责消息投递策略。
-
-边界点是权限校验：当前函数主要排除发送者，没有显式确认发送者一定属于该群。更严谨的方案是在群聊入口先验证发送者群成员身份，避免伪造 groupid 发送消息。
+群聊扇出集合不含发送者本人。每个成员独立走统一投递，route 计数用于日志观察本地、MQ 和离线比例；`allDelivered` 累积所有结果，不能因为前几个成员成功就提前给整条群消息成功 ACK。
 
 ## 面试重点
 
-重要性中等。常见问题：当前 `queryGroups` 是否可能出现 N+1 查询？是；可以用一次 JOIN 后按 group ID 聚合，或批量查询。创建群与加入创建者是否应在一个事务？严格一致性场景应该。
+- 领域对象与数据访问层如何分工，业务层为什么不直接拼 SQL？
+
+- 当前转义拼接、双向好友写入或群成员 N+1 查询有哪些一致性与性能改进空间？

@@ -2,19 +2,41 @@
 
 ## 作用概览
 
-该文件声明 Web 子项目元数据、ES Module 模式、Node 版本和测试/运行命令。项目无 npm 依赖。
+**Web 网关工程清单。** 声明 ESM 运行方式和测试脚本。项目只使用 Node 内置模块，因此没有生产依赖，部署时无需安装大型框架。
 
-## 按学习顺序讲解
+阅读位置：`web/package.json`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-- `private: true`：防止误发布到 npm。
-- `type: module`：让 `.mjs`/JS 使用标准 ESM import/export。
-- `dev/start`：分别以 watch 模式和普通模式启动网关。
-- `test`：运行 Node 内置测试框架下的网关测试。
-- `test:e2e/reliability/load`：从主链路逐步加深到可靠性和压力。
-- 两个 `test:chaos:*`：配合外部脚本暂停基础设施。
-- `engines.node >=20`：约束 Buffer、test runner 等运行环境。
+## 代码片段与详细讲解
+
+### 片段 1：第 1-20 行
+
+```json
+{
+  "name": "chatserver-web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal WebSocket-to-TCP adapter and browser client for ChatServer",
+  "scripts": {
+    "dev": "node --watch gateway.mjs",
+    "start": "node gateway.mjs",
+    "test": "node --test test/*.test.mjs",
+    "test:e2e": "node test/full-stack.mjs",
+    "test:reliability": "node test/reliability.mjs",
+    "test:load": "node test/load.mjs",
+    "test:chaos:rabbitmq": "node test/chaos-rabbitmq.mjs",
+    "test:chaos:mysql": "node test/chaos-mysql.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
+```
+
+这些配置项围绕 `name`、`chatserver-web`、`version`、`private`、`true`、`type`、`module`、`description` 建立当前运行条件。相邻组件使用同名值连接起来，修改时需要同时检查生产默认值、容器覆盖值和测试入口是否仍一致。
 
 ## 面试重点
 
-重要性中等。可能问题：为什么不需要 webpack/Vite？当前页面是原生 ESM 和静态文件，保持对后端架构最小侵入；规模扩大后可独立引入构建工具。
+- 从空环境到服务可访问，构建、配置、健康检查和启动依赖的顺序是什么？
 
+- 哪些值应通过环境变量注入，哪些文件或产物不应进入版本库？

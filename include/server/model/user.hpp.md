@@ -2,53 +2,72 @@
 
 ## 作用概览
 
-`User` 是用户表对应的数据对象，承载 ID、昵称、密码（数据库读取时为哈希）和在线状态。
+**用户领域对象。** 承载数据库用户行在业务层中的 id、名称、密码摘要和在线状态。它是简单值对象，不负责校验密码或执行 SQL。
 
-## 按学习顺序讲解
+阅读位置：`include/server/model/user.hpp`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-- `User(id,name,pwd,state)`：提供默认值，便于表示“未查到用户”。
-- `setId/setName/setPwd/setState`：分别设置四个字段。
-- `getId/getName/getPwd/getState`：分别读取四个字段。
-- 字段为 `protected`，使 `GroupUser` 可以复用用户属性。
+## 代码片段与详细讲解
 
-## 函数详细说明
+### 片段 1：第 1-26 行
 
-### `User(id, name, pwd, state)`
+```cpp
+#ifndef USER_H
+#define USER_H
 
-构造函数用于创建用户对象。默认参数让它既能表示“真实用户”，也能表示“查询失败或空用户”。例如 `UserModel::query` 没查到记录时，会返回默认对象，业务层可以通过 `getId() == -1` 判断用户不存在。
+#include <string>
+using namespace std;
 
-四个参数分别对应用户表的主键、昵称、密码字段和在线状态。需要特别注意：`pwd` 在注册前可能是明文输入，在数据库读取后应该是 bcrypt 哈希，服务端绝不能把它放进发给客户端的 JSON。
+// User 表的轻量数据对象，承接数据库查询结果与业务层之间的数据传递。
+// 这个类不负责数据库访问，只保存用户 id、昵称、密码哈希和在线状态。
+class User
+{
+public:
+    // 默认 id=-1 表示“未命中/无效用户”，这让 query 失败时可以返回一个空对象，
+    // 上层通过 getId() 判断是否查询成功。
+    User(int id = -1, string name = "", string pwd = "", string state = "offline")
+    {
+        this->id = id;
+        this->name = name;
+        this->password = pwd;
+        this->state = state;
+    }
 
-### `setId(id)` / `getId()`
+    // setter 主要给 Model 层在 insert/query 后回填数据库生成的字段。
+    void setId(int id) { this->id = id; }
+    void setName(string name) { this->name = name; }
+    void setPwd(string pwd) { this->password = pwd; }
+    void setState(string state) { this->state = state; }
+```
 
-这组函数负责用户 ID。注册时数据库生成自增 ID 后，`UserModel::insert` 会通过 `setId` 回填；登录、添加好友、单聊、群聊时，业务层大量依赖 `getId` 作为身份和路由依据。
+`User` 是在数据库模型与业务层之间传递的值对象。setter 在查询后逐字段组装对象，getter 在登录响应序列化时读取；对象本身不执行 SQL，也不判断登录或群权限，从而保持职责单一。
 
-面试里可以强调：ID 是服务端认可的身份标识，不能只相信客户端随便传来的 `id`。项目已在业务层维护连接到用户 ID 的映射，用于鉴权和防止冒用。
+### 片段 2：第 27-44 行
 
-### `setName(name)` / `getName()`
+```cpp
 
-这组函数负责用户昵称。注册时写入数据库，登录响应、好友列表、群成员列表、消息展示时都会读取。
+    // getter 返回值而不是引用，避免调用方直接修改内部状态；对象很小，拷贝成本可接受。
+    int getId() { return this->id; }
+    string getName() { return this->name; }
+    string getPwd() { return this->password; }
+    string getState() { return this->state; }
 
-当前没有做昵称长度、字符集、敏感词等校验，属于产品层和安全层可扩展点。如果面试官问“为什么不在实体类校验”，可以回答：当前实体类只是数据载体，校验集中放在业务入口或数据库约束更清楚。
+protected:
+    // protected 允许 GroupUser 继承复用用户基础字段。
+    int id;
+    string name;
+    // 这里保存的是密码哈希，不应保存明文密码；注册/登录时由 PasswordHasher 处理。
+    string password;
+    // 与数据库 User.state 对应，常见值为 "online" / "offline"。
+    string state;
+};
 
-### `setPwd(pwd)` / `getPwd()`
+#endif
+```
 
-这组函数负责密码字段。注册时会存储 bcrypt 哈希；登录时会取出数据库里的哈希并交给密码校验函数验证。
-
-这里最容易被追问的是安全边界：`getPwd` 只应在服务端内部用于校验或迁移旧明文密码，不能被序列化返回给客户端；日志也不能打印密码字段。
-
-### `setState(state)` / `getState()`
-
-这组函数负责在线状态，常见值是 `online` 和 `offline`。登录成功后状态变为在线，退出或连接异常关闭时变为离线。
-
-当前项目还引入 Redis 保存用户所在 server ID，并带 TTL。数据库状态更像持久展示字段，Redis 更像跨节点实时路由字段。面试时如果问一致性，可以说明二者可能短暂不一致，所以投递时不能只看数据库 `state`，还要结合 Redis 路由结果。
-
-### `protected` 字段设计
-
-`User` 的字段是 `protected`，主要是为了让 `GroupUser` 继承后直接复用这些属性。这样群成员对象可以同时拥有用户基础字段和群角色。
-
-这个做法方便，但也让子类能直接访问父类内部状态。更稳的面向对象设计是字段 `private`，通过 getter/setter 或组合关系复用。
+这里固定模块需要长期保存的状态。这些成员把跨回调信息留在对象生命周期内；实现文件中的锁和清理逻辑必须围绕它们保持一致。
 
 ## 面试重点
 
-重要性较低。可讨论：getter 当前返回字符串副本，可改为 `const string&` 并把只读函数标记 `const`；密码字段不应被序列化到客户端。
+- 这个文件处于哪一层，它保存的数据由谁创建、由谁消费？
+
+- 如果删除或修改本文件，最先受影响的运行链路是什么？

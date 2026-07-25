@@ -2,94 +2,319 @@
 
 ## 作用概览
 
-这是项目最全面的行为正确性测试，重点验证“不冒用、不重复、尽量不丢、同发送者有序、离线可恢复”，而不是只验证接口能返回。
+**可靠性端到端测试。** 在双节点拓扑验证非法输入、重复登录、身份冒用、跨节点投递、幂等去重、在线/离线顺序与离线消息不重放。每个断言对应用户可感知的数据一致性问题。
 
-## 按学习顺序讲解
+阅读位置：`web/test/reliability.mjs`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-- `trackedClient(port)`：创建客户端并加入集合，确保 finally 可清理。
-- `logoutAndClose(client,id)`：主动注销、等待服务处理，再关闭并移出集合。
-- `assertOrdered(messages,startSequence)`：同时断言消息 ID 唯一、`client_seq` 连续、发送时间单调。
-- 顶层测试顺序：
-  1. 非法注册、损坏 JSON、缺字段请求；
-  2. 三用户跨两个节点注册登录；
-  3. 同账号并发登录恰好一个成功，以及登录中重复与心跳；
-  4. 伪造身份返回 401；
-  5. 好友、建群、入群在重登后仍存在；
-  6. 本地、跨节点、群聊投递；
-  7. 重发同 ID 返回 `ACK_DEDUP` 且收件人无第二份；
-  8. 特殊字符与长消息保真；
-  9. 批量在线消息 ACK、唯一性、顺序；
-  10. 批量离线消息恢复、顺序和二次登录不重放。
-- `finally` 关闭所有仍存活客户端。
+## 代码片段与详细讲解
 
-## 函数详细说明
+### 片段 1：第 1-25 行
 
-### `trackedClient(port)`
+```javascript
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 
-函数调用公共 `createClient` 并统一传入本场景的长超时，连接成功后加入 `clients` Set，再返回客户端。所有创建路径都经过这个包装，finally 因此能关闭中途异常时仍存活的连接。只有在已经主动关闭后才从 Set 删除，避免重复清理不是问题，但遗漏登记会让 Node 进程挂住。
+import { MSG, createClient, delay, login, parseEmbedded, register } from './e2e-client.mjs';
 
-### `logoutAndClose(client, id)`
+// 可靠性测试覆盖“面试中容易被追问”的端到端场景：非法输入、重复登录、
+// 身份伪造、跨节点消息、群聊去重、在线/离线顺序、离线消息不重放。
+const port1 = Number(process.env.CHAT_E2E_PORT_1 ?? 8080);
+const port2 = Number(process.env.CHAT_E2E_PORT_2 ?? 8081);
+const timeoutMs = Number(process.env.CHAT_RELIABILITY_TIMEOUT_MS ?? 60_000);
 
-先发送业务注销消息，让服务端有机会条件删除 Redis 路由和本地身份映射；短暂等待后发送 WebSocket close，并从跟踪集合删除。它用于需要随后重新登录验证持久化状态的场景。
+// orderCount/online 和 offlineCount/offline 分别压在线顺序链路和离线存储链路。
+// 这两个值可以通过环境变量调大，用于定位高并发下乱序或漏存问题。
+const orderCount = Number(process.env.CHAT_ORDER_MESSAGES ?? 200);
+const offlineCount = Number(process.env.CHAT_OFFLINE_MESSAGES ?? 100);
+const suffix = `${Date.now()}-${crypto.randomInt(1000, 9999)}`;
+const password = 'reliability-demo-123';
+const clients = new Set();
 
-固定 200ms 是简化的同步点，慢机器上可能不足。更稳健的协议应给注销增加响应，测试等待 ACK 或轮询路由消失，而不是依赖时间。
+// 统一记录测试打开的连接，让 finally 能完整清理；这比每段手写 close 更可靠。
+async function trackedClient(port) {
+  const client = await createClient(port, { timeoutMs });
+  clients.add(client);
+  return client;
+}
+```
 
-### `assertOrdered(messages, startSequence)`
+新建连接后立即加入统一集合，保证测试在任意断言处抛错时仍能在 finally 中找到并关闭它；这避免失败用例留下在线用户影响下一轮重复登录判断。
 
-函数先把所有 `message_id` 放入 Set，断言集合大小等于数组长度，从而同时发现重复 ID。随后按接收数组顺序检查 `client_seq` 必须从给定起点连续增加，并检查 `sent_at_ms` 非递减。错误信息带出首个违规下标，便于定位。
+这些依赖明确了本片段所在层的边界：密码或随机数、断言框架。项目内部头文件提供协议和领域对象，外部库只承担基础能力；业务数据如何流转仍由当前模块决定。
 
-它验证的是同一发送者、同一会话的观察顺序。时间戳来自测试发送端，只作为辅助单调字段；系统不应仅靠客户端时间决定全局消息顺序。
+`CHAT_E2E_PORT_1`、`CHAT_E2E_PORT_2`、`CHAT_RELIABILITY_TIMEOUT_MS`、`CHAT_ORDER_MESSAGES`、`CHAT_OFFLINE_MESSAGES` 控制本轮测试连接的两个网关、等待上限及在线/离线消息数。默认 8080/8081 会把 Alice 与 Carol 放在不同后端节点；调大消息数是在相同断言下增加压力，而不是改变测试语义。
 
-### 顶层场景：非法输入边界
+### 片段 2：第 26-50 行
 
-脚本先用独立客户端发送空昵称/短密码注册，要求注册失败；发送损坏 JSON 原文，要求 400；再发送缺少登录字段的对象，同样要求 400。这个阶段证明非法输入被明确拒绝且连接不会因一次坏消息崩溃，随后关闭该客户端避免影响正常场景。
+```javascript
 
-### 顶层场景：注册与跨节点并发登录
+// 先发业务登出再关闭连接，避免服务端只感知 TCP 断开而没及时清理在线状态。
+async function logoutAndClose(client, id) {
+  client.send({ msgid: MSG.LOGOUT, id });
+  await delay(200);
+  client.close();
+  clients.delete(client);
+}
 
-Alice、Bob 连接节点 1，Carol 连接节点 2，用户名使用时间随机后缀保证可重复运行。另建一个 race 用户，关闭注册连接后从两个节点同时发起登录，并用 `Promise.all` 收集两个响应，断言成功数严格等于 1。
+// 顺序断言同时检查三件事：message_id 不重复、client_seq 连续递增、
+// 时间戳单调。这样可以分别暴露重复投递、乱序投递和离线读取排序错误。
+function assertOrdered(messages, startSequence) {
+  const ids = new Set(messages.map((message) => message.message_id));
+  assert.equal(ids.size, messages.length, 'received message ids must be unique');
+  for (let i = 0; i < messages.length; i += 1) {
+    assert.equal(messages[i].client_seq, startSequence + i, `out-of-order message at index ${i}`);
+    if (i > 0) {
+      assert.ok(messages[i].sent_at_ms >= messages[i - 1].sent_at_ms, 'message timestamps must be monotonic');
+    }
+  }
+}
 
-“至少一个失败”不够，因为两个都失败也会通过；“恰好一个成功”才验证 Redis `SET NX` 的跨节点互斥。胜者主动注销，败者关闭，清除该辅助账户对后续测试的干扰。
+let alice;
+let bob;
+let carol;
+```
 
-### 顶层场景：重复登录、心跳与身份伪造
+先发送业务 LOGOUT，再短暂等待服务端删除本地映射、Redis 路由和数据库 online 状态，最后关闭 WebSocket。相比直接断网，这让后续离线场景从确定状态开始。
 
-三名主用户正常登录后，脚本从另一节点再次登录 Alice，要求失败。随后 Alice 发送心跳并等待专用 ACK，确认会话路由可续期。身份攻击请求故意把 JSON `id` 改成 Carol，却从 Alice 的连接发出，服务端必须返回 401；这直接验证“连接绑定身份”而非相信客户端字段。
+断言先用 Set 检查 message_id 唯一，再逐项比较连续 client_seq 和非递减发送时间。三种失败分别对应重复投递、会话乱序和离线读取顺序异常。
 
-### 顶层场景：好友与群组持久化
+循环每次只消费已经确认完整的字节或已经成功写出的部分。遇到正文尚未到齐便停在当前偏移，下一次收到数据后继续；发送短写则从剩余位置续发，这正是流式 socket 不能假设“一次调用完成一条消息”的原因。
 
-Alice 发起加好友和建群，等待数据库写入后注销并重登。登录响应中的嵌套 friends/groups 被解析，必须找到 Carol 和新群。Carol 加入该群后同样注销重登，并检查群列表包含目标 ID。
+### 片段 3：第 51-73 行
 
-这里通过重登后的数据库读取证明关系持久化，而不是只看写请求没有报错。当前协议缺少这些操作的专用 ACK，所以用了短 delay；未来应以明确响应替代。
+```javascript
 
-### 顶层场景：本地、跨节点与群聊投递
+try {
+  // 第一组是输入边界：空用户名、畸形 JSON、缺少登录字段都应该被明确拒绝，
+  // 不能让异常消息污染业务状态或导致服务端崩溃。
+  const invalidClient = await trackedClient(port1);
+  invalidClient.send({ msgid: MSG.REGISTER, name: '', password: '123' });
+  assert.notEqual((await invalidClient.waitFor((m) => m.msgid === MSG.REGISTER_ACK)).errno, 0);
+  invalidClient.sendRawText('{not-json');
+  assert.equal((await invalidClient.waitFor((m) => m.msgid === MSG.ERROR)).code, 400);
+  invalidClient.send({ msgid: MSG.LOGIN });
+  assert.equal((await invalidClient.waitFor((m) => m.msgid === MSG.ERROR)).code, 400);
+  invalidClient.close();
+  clients.delete(invalidClient);
 
-本地消息由 Alice 发给同节点 Bob，跨节点消息发给 Carol；每条都同时等待发送方 `ACK_OK` 和接收方匹配 ID 的业务消息，并检查正文。群聊再验证成员 Carol 收到。三种路径分别覆盖本地连接表、Redis + RabbitMQ 路由以及群成员展开投递。
+  alice = await trackedClient(port1);
+  bob = await trackedClient(port1);
+  carol = await trackedClient(port2);
+  const aliceName = `可靠性-甲-${suffix}`;
+  const bobName = `可靠性-乙-${suffix}`;
+  const carolName = `可靠性-丙-${suffix}`;
+  const aliceId = await register(alice, aliceName, password, timeoutMs);
+  const bobId = await register(bob, bobName, password, timeoutMs);
+  const carolId = await register(carol, carolName, password, timeoutMs);
+```
 
-群聊用相同 message ID 再发一次，预期 `ACK_DEDUP`，并用 `expectNoMessage` 观察 Carol 不会收到第二份。这是正断言和负断言组合：只看去重 ACK 不能证明接收侧真的没有重复。
+场景先发送空名称/过短密码，预期注册 errno 非零；再直接发送无法解析的 JSON，预期 ERROR 400；最后发送缺少 id/password 的登录对象，也应是 400。随后新建三名唯一用户，为后续本地与跨节点测试隔离数据。
 
-### 顶层场景：特殊字符和长正文保真
+### 片段 4：第 74-95 行
 
-正文包含单引号、反斜杠、中文、换行、类似 script 的文本以及重复长字符串。脚本要求 ACK 成功并对收到的 `msg` 做严格相等比较，覆盖 JSON 转义、UTF-8、网关传输和数据库/消息总线可能的截断问题。它验证文本被原样传输；浏览器是否安全展示还由 `textContent` 和前端测试/审查保证。
+```javascript
 
-### 顶层场景：分布式去重
+  // 并发重复登录用于验证在线状态的原子性：同一个用户同时从两个节点登录，
+  // 只能有一个连接赢得登录权，否则后续消息会出现双收或状态覆盖。
+  const raceSeed = await trackedClient(port1);
+  const raceId = await register(raceSeed, `并发登录-${suffix}`, password, timeoutMs);
+  raceSeed.close();
+  clients.delete(raceSeed);
+  const race1 = await trackedClient(port1);
+  const race2 = await trackedClient(port2);
+  race1.send({ msgid: MSG.LOGIN, id: raceId, password });
+  race2.send({ msgid: MSG.LOGIN, id: raceId, password });
+  const raceResponses = await Promise.all([
+    race1.waitFor((m) => m.msgid === MSG.LOGIN_ACK, timeoutMs),
+    race2.waitFor((m) => m.msgid === MSG.LOGIN_ACK, timeoutMs),
+  ]);
+  assert.equal(raceResponses.filter((response) => response.errno === 0).length, 1,
+    'concurrent duplicate login must have exactly one winner');
+  const raceWinner = raceResponses[0].errno === 0 ? race1 : race2;
+  const raceLoser = raceWinner === race1 ? race2 : race1;
+  await logoutAndClose(raceWinner, raceId);
+  raceLoser.close();
+  clients.delete(raceLoser);
+```
 
-脚本保存一份完整 payload，第一次发送要求 ACK_OK 并收到正文；第二次原样发送，要求 ACK_DEDUP，并观察 800ms 内没有第二份。重试复用相同 ID 是关键，如果重新生成 ID，服务端无法知道两次发送代表同一业务消息。
+同一账号的两个连接分别连 8080 和 8081，并在等待器就绪后同时发 LOGIN。断言成功响应恰好一个，直接验证 Redis NX 登录闸门；随后只登出赢家，输家从未拥有路由，不应执行状态清理。
 
-### 顶层场景：在线突发顺序与不丢失
+并发操作在等待器或收集器就绪后同时启动，避免响应太快而被测试代码错过。这里关注的是共享状态竞争：例如重复登录只能有一个赢家，或多连接突发发送后每组仍必须收齐自己的消息。
 
-在发送前先创建 ACK collect 和 delivery collect，避免高并发响应在观察器注册前到达。随后快速发送 `orderCount` 条消息，每条使用连续 `client_seq`、唯一 ID 和单调时间。`Promise.all` 要求两类观察器都收满；所有 ACK 必须成功，收到消息再交给 `assertOrdered`。
+### 片段 5：第 96-124 行
 
-收满数量验证该次运行未观察到丢失，Set 与序列断言验证无重复和无乱序。测试没有注入进程崩溃，所以结论只适用于当前运行拓扑和故障模型。
+```javascript
 
-### 顶层场景：离线突发恢复与不重放
+  // 常规登录后，再尝试登录 Alice 的第二个连接，验证重复登录保护在稳定状态也生效。
+  assert.equal((await login(alice, aliceId, password, timeoutMs)).errno, 0);
+  assert.equal((await login(bob, bobId, password, timeoutMs)).errno, 0);
+  assert.equal((await login(carol, carolId, password, timeoutMs)).errno, 0);
 
-先注销 Carol，Alice 快速发送 `offlineCount` 条连续消息并收齐成功 ACK。Carol 重连登录后，从 `offlinemsg` 筛选本批前缀，要求数量完全一致并调用 `assertOrdered`。随后再次注销登录，第二次离线列表中同前缀数量必须为 0，证明正常消费后不会重复回放。
+  const duplicateLogin = await trackedClient(port2);
+  assert.notEqual((await login(duplicateLogin, aliceId, password, timeoutMs)).errno, 0);
+  duplicateLogin.close();
+  clients.delete(duplicateLogin);
 
-第一次登录返回和删除之间仍存在崩溃窗口，该测试只能覆盖无崩溃流程。更强语义需要离线消息唯一键、消费状态以及客户端确认。
+  // 心跳证明连接可用；随后故意让 Alice 冒充 Carol 发消息，验证服务端不会相信客户端传来的 id。
+  alice.send({ msgid: MSG.HEARTBEAT, id: aliceId, ts: Date.now() });
+  assert.equal((await alice.waitFor((m) => m.msgid === MSG.HEARTBEAT_ACK)).msgid, MSG.HEARTBEAT_ACK);
+  alice.send({ msgid: MSG.ONE_CHAT, id: carolId, toid: bobId, name: '伪造用户', msg: '不应送达', message_id: `spoof-${suffix}` });
+  assert.equal((await alice.waitFor((m) => m.msgid === MSG.ERROR)).code, 401);
 
-### `finally` 清理
+  // 好友和建群需要落库。这里登出再登录，是为了确认这些关系不是只存在内存里。
+  const groupName = `可靠性群-${suffix}`;
+  alice.send({ msgid: MSG.ADD_FRIEND, id: aliceId, friendid: carolId });
+  alice.send({ msgid: MSG.CREATE_GROUP, id: aliceId, groupname: groupName, groupdesc: '完整测试群组' });
+  await delay(300);
+  await logoutAndClose(alice, aliceId);
+  alice = await trackedClient(port1);
+  const aliceRelogin = await login(alice, aliceId, password, timeoutMs);
+  assert.equal(aliceRelogin.errno, 0);
+  assert.ok(parseEmbedded(aliceRelogin.friends).some((friend) => Number(friend.id) === Number(carolId)), 'friend relation must persist');
+  const group = parseEmbedded(aliceRelogin.groups).find((item) => item.groupname === groupName);
+  assert.ok(group, 'created group must be returned after relogin');
+```
 
-遍历 Set 关闭所有仍登记的客户端。任何中间断言、超时或 JSON 解析错误都不会跳过清理，减少 Redis 在线路由和 socket 句柄污染下一轮测试。测试生成唯一账户名，因此数据库留下测试数据不会造成名称冲突，但长期环境仍应有数据清理策略。
+这一组先验证稳定在线后的第二次登录被拒绝，再让 Alice 连接在 JSON 中冒充 Carol，必须收到 401。好友和建群操作后主动登出重登，登录响应中仍能查到关系，证明数据确实写入 MySQL 而非只留在进程内存。
+
+### 片段 6：第 125-153 行
+
+```javascript
+
+  carol.send({ msgid: MSG.ADD_GROUP, id: carolId, groupid: group.id });
+  await delay(300);
+  await logoutAndClose(carol, carolId);
+  carol = await trackedClient(port2);
+  const carolRelogin = await login(carol, carolId, password, timeoutMs);
+  assert.equal(carolRelogin.errno, 0);
+  assert.ok(parseEmbedded(carolRelogin.groups).some((item) => Number(item.id) === Number(group.id)), 'joined group must persist');
+
+  // 单聊分两段：同节点直投和跨节点投递。跨节点路径会走 Redis/RabbitMQ 等协作链路，
+  // 是判断多实例部署是否真的可用的关键。
+  const localId = `local-${suffix}`;
+  alice.send({ msgid: MSG.ONE_CHAT, id: aliceId, toid: bobId, name: aliceName, msg: '同节点消息', time: new Date().toISOString(), sent_at_ms: Date.now(), message_id: localId, client_seq: 1 });
+  assert.equal((await alice.waitFor((m) => m.msgid === MSG.ACK && m.message_id === localId)).ack_state, 0);
+  assert.equal((await bob.waitFor((m) => m.msgid === MSG.ONE_CHAT && m.message_id === localId)).msg, '同节点消息');
+
+  const crossId = `cross-${suffix}`;
+  alice.send({ msgid: MSG.ONE_CHAT, id: aliceId, toid: carolId, name: aliceName, msg: '跨节点消息', time: new Date().toISOString(), sent_at_ms: Date.now(), message_id: crossId, client_seq: 1 });
+  assert.equal((await alice.waitFor((m) => m.msgid === MSG.ACK && m.message_id === crossId)).ack_state, 0);
+  assert.equal((await carol.waitFor((m) => m.msgid === MSG.ONE_CHAT && m.message_id === crossId)).msg, '跨节点消息');
+
+  // 群聊先验证正常送达，再用相同 message_id 重发，确认幂等表/去重逻辑能阻断重复投递。
+  const groupMessageId = `group-${suffix}`;
+  alice.send({ msgid: MSG.GROUP_CHAT, id: aliceId, groupid: group.id, name: aliceName, msg: '群聊消息', time: new Date().toISOString(), sent_at_ms: Date.now(), message_id: groupMessageId, client_seq: 1 });
+  assert.equal((await alice.waitFor((m) => m.msgid === MSG.ACK && m.message_id === groupMessageId)).ack_state, 0);
+  assert.equal((await carol.waitFor((m) => m.msgid === MSG.GROUP_CHAT && m.message_id === groupMessageId)).msg, '群聊消息');
+  alice.send({ msgid: MSG.GROUP_CHAT, id: aliceId, groupid: group.id, name: aliceName, msg: '群聊消息', time: new Date().toISOString(), sent_at_ms: Date.now(), message_id: groupMessageId, client_seq: 1 });
+  assert.equal((await alice.waitFor((m) => m.msgid === MSG.ACK && m.message_id === groupMessageId)).ack_state, 1);
+  await carol.expectNoMessage((m) => m.message_id === groupMessageId, 800);
+```
+
+Bob 与 Alice 位于同一节点，local 消息应走连接表直发；Carol 位于另一节点，cross 消息必须经过 Redis 路由和 RabbitMQ。群消息用同一 message_id 再发一次，发送端应收到 ACK_DEDUP，Carol 在观察窗口内不得再收到副本。
+
+### 片段 7：第 154-182 行
+
+```javascript
+
+  // 特殊字符和长消息用于防 SQL/JSON/HTML 边界问题：服务端应原样保存和转发，
+  // 前端再负责展示时转义，不能在中间链路截断或错误解释内容。
+  const specialId = `special-${suffix}`;
+  const specialContent = `引号'、反斜杠\\、中文、换行\n、<script>不是标签</script>-${'长消息'.repeat(300)}`;
+  alice.send({ msgid: MSG.ONE_CHAT, id: aliceId, toid: carolId, name: aliceName, msg: specialContent, time: new Date().toISOString(), sent_at_ms: Date.now(), message_id: specialId, client_seq: 2 });
+  assert.equal((await alice.waitFor((m) => m.msgid === MSG.ACK && m.message_id === specialId)).ack_state, 0);
+  assert.equal((await carol.waitFor((m) => m.msgid === MSG.ONE_CHAT && m.message_id === specialId)).msg, specialContent);
+
+  // 分布式去重场景：第一次发送成功，第二次携带同一个 message_id 应返回重复 ACK，
+  // 接收者也不应该再次收到同一条消息。
+  const duplicateId = `duplicate-${suffix}`;
+  const duplicatePayload = { msgid: MSG.ONE_CHAT, id: aliceId, toid: carolId, name: aliceName, msg: '只应收到一次', time: new Date().toISOString(), sent_at_ms: Date.now(), message_id: duplicateId, client_seq: 3 };
+  alice.send(duplicatePayload);
+  assert.equal((await alice.waitFor((m) => m.msgid === MSG.ACK && m.message_id === duplicateId)).ack_state, 0);
+  await carol.waitFor((m) => m.msgid === MSG.ONE_CHAT && m.message_id === duplicateId);
+  alice.send(duplicatePayload);
+  assert.equal((await alice.waitFor((m) => m.msgid === MSG.ACK && m.message_id === duplicateId)).ack_state, 1);
+  await carol.expectNoMessage((m) => m.message_id === duplicateId, 800);
+
+  // 在线顺序压测：同一连接连续发送 orderCount 条消息，接收端必须按 client_seq 收到。
+  // 如果服务端多线程处理没有保持单连接顺序，这里会立刻暴露。
+  const orderPrefix = `order-${suffix}-`;
+  const orderStart = Date.now();
+  const ackPromise = alice.collect((m) => m.msgid === MSG.ACK && String(m.message_id).startsWith(orderPrefix), orderCount, timeoutMs);
+  const deliveryPromise = carol.collect((m) => m.msgid === MSG.ONE_CHAT && String(m.message_id).startsWith(orderPrefix), orderCount, timeoutMs);
+  for (let i = 0; i < orderCount; i += 1) {
+    alice.send({ msgid: MSG.ONE_CHAT, id: aliceId, toid: carolId, name: aliceName, msg: `顺序消息-${i + 1}`, time: new Date(orderStart + i).toISOString(), sent_at_ms: orderStart + i, message_id: `${orderPrefix}${i + 1}`, client_seq: i + 4 });
+  }
+```
+
+在线顺序场景在收集器注册后连续发送 orderCount 条消息，每条 client_seq 和 sent_at_ms 加一。只有 ACK 全为成功、接收数完整且 assertOrdered 通过，才能同时证明服务端未丢、未重并保持单连接顺序。
+
+### 片段 8：第 183-210 行
+
+```javascript
+  const [orderAcks, orderedMessages] = await Promise.all([ackPromise, deliveryPromise]);
+  assert.ok(orderAcks.every((ack) => ack.ack_state === 0), 'all ordered messages must be acknowledged');
+  assertOrdered(orderedMessages, 4);
+
+  // 离线顺序压测：让 Carol 下线后连续发送，随后登录时从 offlinemsg 中恢复。
+  // 这里能覆盖数据库写入、读取排序、登录后清理离线消息三段逻辑。
+  await logoutAndClose(carol, carolId);
+  const offlinePrefix = `offline-burst-${suffix}-`;
+  const offlineStart = orderStart + orderCount + 1;
+  const offlineAckPromise = alice.collect((m) => m.msgid === MSG.ACK && String(m.message_id).startsWith(offlinePrefix), offlineCount, timeoutMs);
+  for (let i = 0; i < offlineCount; i += 1) {
+    alice.send({ msgid: MSG.ONE_CHAT, id: aliceId, toid: carolId, name: aliceName, msg: `离线消息-${i + 1}`, time: new Date(offlineStart + i).toISOString(), sent_at_ms: offlineStart + i, message_id: `${offlinePrefix}${i + 1}`, client_seq: orderCount + 4 + i });
+  }
+  assert.ok((await offlineAckPromise).every((ack) => ack.ack_state === 0));
+  carol = await trackedClient(port2);
+  const offlineLogin = await login(carol, carolId, password, timeoutMs);
+  assert.equal(offlineLogin.errno, 0);
+  const offlineMessages = parseEmbedded(offlineLogin.offlinemsg).filter((message) => String(message.message_id).startsWith(offlinePrefix));
+  assert.equal(offlineMessages.length, offlineCount, 'all offline messages must be restored');
+  assertOrdered(offlineMessages, orderCount + 4);
+
+  // 再次登录确认“已消费离线消息不重放”。这是用户最容易感知的重复收消息问题。
+  await logoutAndClose(carol, carolId);
+  carol = await trackedClient(port2);
+  const secondOfflineLogin = await login(carol, carolId, password, timeoutMs);
+  assert.equal(secondOfflineLogin.errno, 0);
+  const replayed = parseEmbedded(secondOfflineLogin.offlinemsg).filter((message) => String(message.message_id).startsWith(offlinePrefix));
+  assert.equal(replayed.length, 0, 'consumed offline messages must not replay on normal relogin');
+```
+
+离线场景先让 Carol 正常登出，再发送 offlineCount 条消息。Alice 收到成功 ACK 说明均已落库；Carol 登录后只筛选本轮前缀，数量和序号必须完整，第二次登录还必须为零，验证消费后不正常重放。
+
+### 片段 9：第 211-228 行
+
+```javascript
+
+  console.log(JSON.stringify({
+    status: 'passed',
+    users: { aliceId, bobId, carolId, raceId },
+    counts: { orderedOnline: orderCount, orderedOffline: offlineCount },
+    checks: [
+      'invalid-input', 'malformed-json', 'register', 'login', 'concurrent-login',
+      'duplicate-login', 'heartbeat', 'auth-spoof-rejection', 'friend', 'create-group',
+      'join-group', 'local-delivery', 'cross-node-delivery', 'group-delivery',
+      'group-dedup', 'special-character-long-message', 'distributed-dedup',
+      'no-duplicate-receive', 'online-order', 'online-no-loss',
+      'offline-order', 'offline-no-loss', 'offline-no-replay',
+    ],
+  }, null, 2));
+} finally {
+  // 测试失败时也清理所有连接，避免在线状态残留影响下一轮可靠性测试。
+  for (const client of clients) client.close();
+}
+```
+
+`finally` 会遍历本轮登记的客户端并关闭连接。即使中途断言抛错，服务端也能触发断线清理，避免残留在线路由让下一轮重复登录或离线场景得到假结果。
+
+循环遍历 `users`，把每个元素独立转换、投递或校验。结果按遍历顺序追加，某个元素失败时由本片段的状态变量或断言记录，不能用一次总体成功掩盖单项失败。
 
 ## 面试重点
 
-重要性最高。要能解释每个性质如何通过正断言和负断言证明。注意措辞：测试通过说明在该拓扑、消息量和故障模型下未观察到丢失/重复/乱序，不等于形式化证明任意高并发和任意宕机下绝对成立。
+- 能否沿着一条单聊消息说明本地直发、跨节点路由、离线落库、ACK 与重试之间的成功语义？
+
+- Redis 或 RabbitMQ 故障时系统如何降级，哪些保证仍成立，哪些保证会变弱？
+
+- 为什么“至少一次发送 + message_id 幂等”不等于严格 Exactly Once？

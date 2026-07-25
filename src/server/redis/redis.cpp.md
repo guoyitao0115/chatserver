@@ -2,88 +2,305 @@
 
 ## 作用概览
 
-该文件实现 Redis 同步命令，将跨节点共享去重和会话路由压缩为少量原子操作。
+**Redis 原子状态实现。** 使用 hiredis 串行执行 `SET NX EX` 和 Lua 条件更新/删除，避免“先 GET 再 SET/DEL”在多节点间产生竞态。Redis 连接由互斥锁保护，命令失败以 -1 告知业务层降级。
 
-## 按学习顺序讲解
+阅读位置：`src/server/redis/redis.cpp`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-- `Redis()`：把上下文初始化为空。
-- `~Redis()`：持锁释放上下文，防止析构与命令并发。
-- `connect()`：读取地址和端口，以超时连接；失败时清理半初始化上下文。
-- `markMessageIfFirst(key,ttl)`：使用二进制安全的 `%b` 和 `SET NX EX`；OK、NIL、异常分别映射为 1、0、-1。
-- `removeMessageMark(key)`：执行 DEL，供失败重试撤销幂等记录。
-- `claimUserServer(userid,serverId,ttl)`：原子创建路由，只有首个并发登录成功。
-- `refreshUserServerIfMatches(...)`：Lua 中比较 value 后 EXPIRE，防止旧连接续期新节点会话。
-- `getUserServer(userid)`：GET 并按 Redis 返回长度构造节点 ID。
-- `removeUserServerIfMatches(...)`：Lua 区分不存在、匹配删除和不匹配，防止旧连接删掉新会话。
+## 代码片段与详细讲解
 
-## 函数详细说明
+### 片段 1：第 1-27 行
 
-### `Redis::Redis()`
+```cpp
+#include "redis.hpp"
+#include "config.hpp"
 
-构造函数只把 `_context` 初始化为 `nullptr`，表示还没有建立 Redis 连接。这样析构和各个命令函数都能通过空指针判断当前是否可用。
+#include <iostream>
 
-它不在构造阶段自动连接，是为了让调用方显式决定连接时机，并能在连接失败时继续以降级模式运行。例如消息去重可以在 Redis 不可用时退回本地内存去重。
+using namespace std;
 
-### `Redis::~Redis()`
+// 构造时不立即连接 Redis，避免对象创建失败。main() 会在读取配置后显式调用 connect()。
+Redis::Redis() : _context(nullptr) {}
 
-析构函数先加 `_mutex`，再检查 `_context` 并调用 `redisFree`。加锁是为了避免其他线程正在使用 hiredis 同步连接时同时释放底层上下文。
+Redis::~Redis()
+{
+    // hiredis 的 redisContext 不是线程安全对象，析构释放也放在同一把锁下，
+    // 防止业务线程仍在执行 Redis 命令时发生并发释放。
+    lock_guard<mutex> lock(_mutex);
+    if (_context != nullptr)
+    {
+        redisFree(_context);
+        _context = nullptr;
+    }
+}
 
-释放后把 `_context` 置空，避免悬空指针。当前类持有的是单个同步连接，所以所有命令都通过同一把锁串行化，简单可靠，但高并发下会成为吞吐瓶颈。
+bool Redis::connect()
+{
+    // 连接参数来自环境变量，默认值支持本地开发直接启动。
+    // 1.5 秒超时可以避免 Redis 故障时服务端启动或请求线程长期卡住。
+    lock_guard<mutex> lock(_mutex);
+```
 
-### `connect()`
+互斥区保护 `_mutex` 的一致性。这里需要关注的不只是单个容器不崩溃，还要保证成对索引或链表/哈希表同步更新，其他 I/O 线程不会观察到一半完成的状态。
 
-该函数从环境变量读取 Redis 地址和端口，默认连接 `127.0.0.1:6379`，并设置 1.5 秒超时。随后调用 `redisConnectWithTimeout` 建立同步连接。
+### 片段 2：第 28-49 行
 
-如果连接失败，函数会打印原因，释放半初始化的 `_context`，并返回 false。这样上层可以继续启动服务，只是跨节点路由或 Redis 去重能力会受影响。
+```cpp
 
-连接成功后返回 true。当前没有实现自动重连，因此运行过程中 Redis 断开时，后续命令可能返回异常语义，业务层需要按返回值降级或失败处理。
+    const string host = chatserver::config::envOr("CHAT_REDIS_HOST", "127.0.0.1");
+    const int port = chatserver::config::envIntOr("CHAT_REDIS_PORT", 6379);
+    struct timeval timeout {1, 500000};
 
-### `markMessageIfFirst(key, ttlSeconds)`
+    _context = redisConnectWithTimeout(host.c_str(), port, timeout);
+    if (_context == nullptr || _context->err != 0)
+    {
+        const string reason = _context != nullptr ? _context->errstr : "allocation failed";
+        cerr << "[redis] connect failed: " << reason
+             << " host=" << host << ":" << port << endl;
+        if (_context != nullptr)
+        {
+            redisFree(_context);
+            _context = nullptr;
+        }
+        return false;
+    }
 
-这个函数用于跨节点消息去重。`key` 通常由 `message_id` 派生，`ttlSeconds` 是去重记录保留时间。
+    cout << "[redis] connected. host=" << host << ":" << port << endl;
+    return true;
+}
+```
 
-实现使用 Redis 的 `SET key 1 EX ttl NX`，这是一个原子命令：只有 key 不存在时才写入并设置过期时间。返回值约定为 1 表示首次出现，0 表示重复消息，-1 表示 Redis 不可用或参数非法。
+本片段读取 `CHAT_REDIS_HOST`、`CHAT_REDIS_PORT`。未设置时采用紧邻的本机默认值；容器部署则覆盖这些值，因此同一二进制可以作为不同节点运行，无需重新编译。
 
-命令中使用 `%b`，是 hiredis 的二进制安全格式，能正确处理包含特殊字符的 key。业务层拿到 0 会返回 `ACK_DEDUP`，拿到 -1 则退回本地 `MsgDedup`，避免 Redis 故障时系统完全不可用。
+Lua 把读取、比较和更新压进 Redis 的一次原子执行。若拆成多条客户端命令，比较完成到删除/续期之间可能已有新登录改写路由，旧会话就会误删或误续期新状态。
 
-### `removeMessageMark(key)`
+### 片段 3：第 50-75 行
 
-这个函数删除消息去重标记，通常在“消息最终没有投递也没有落库”时调用。这样客户端用同一个 `message_id` 重试时，不会被错误地当成重复消息拒绝。
+```cpp
 
-实现调用 `DEL key`。返回 true 只表示 Redis 返回了整数类型结果，不严格区分删除了 1 个 key 还是 key 原本不存在。这个语义对撤销标记足够，因为目标是尽力清理。
+int Redis::markMessageIfFirst(const string &key, int ttlSeconds)
+{
+    // SET ... NX 把“检查是否存在”和“写入标记”合并为一个原子命令。
+    // 多个服务节点同时处理同一个 message_id 时，只有一个节点会拿到 OK。
+    lock_guard<mutex> lock(_mutex);
+    if (_context == nullptr || key.empty() || ttlSeconds <= 0)
+    {
+        return -1;
+    }
 
-### `claimUserServer(userid, serverId, ttlSeconds)`
+    redisReply *reply = static_cast<redisReply *>(redisCommand(
+        _context, "SET %b 1 EX %d NX", key.data(), key.size(), ttlSeconds));
+    if (reply == nullptr)
+    {
+        // 返回 -1 表示 Redis 不可判定。上层不能把它当成“重复消息”，否则会误丢消息。
+        cerr << "[redis] dedup command failed" << endl;
+        return -1;
+    }
 
-这个函数用于登录时抢占用户路由。Redis key 形如 `chat:user:server:<userid>`，value 是当前服务节点 ID，TTL 由心跳续期。
+    int result = -1;
+    // OK 表示首次登记；NIL 表示 NX 条件不满足，即该 message_id 已经处理过。
+    if (reply->type == REDIS_REPLY_STATUS && reply->str != nullptr && string(reply->str) == "OK")
+    {
+        result = 1;
+    }
+```
 
-实现同样使用 `SET key serverId EX ttl NX`，保证并发登录时只有第一个连接能成功写入。返回 1 表示抢占成功，0 表示该用户已经在其他连接或节点在线，-1 表示 Redis 出错或参数非法。
+`SET key 1 NX EX ttl` 把“判断不存在”和“写入”合成一条 Redis 原子命令。reply 为 OK 表示本消息第一次出现，nil 表示已有处理者，连接或协议错误返回 -1 触发本地兜底。
 
-这是项目避免同一用户多端/多节点同时登录的核心逻辑。需要注意，它依赖 Redis 的原子性，但如果 Redis 自身发生主从切换或网络分区，仍不能声称覆盖所有分布式一致性故障模型。
+### 片段 4：第 76-99 行
 
-### `refreshUserServerIfMatches(userid, serverId, ttlSeconds)`
+```cpp
+    else if (reply->type == REDIS_REPLY_NIL)
+    {
+        result = 0;
+    }
+    freeReplyObject(reply);
+    return result;
+}
 
-这个函数用于心跳续期，但只允许当前连接仍持有路由时续期。它通过 Lua 脚本完成“读取 value、比较 serverId、续期 EXPIRE”三个动作，避免中间被其他连接抢占后旧连接误续期。
+bool Redis::removeMessageMark(const string &key)
+{
+    // 消息落库或投递失败后删除标记，让客户端用同一个 message_id 重试。
+    // 如果不删除，失败消息会被后续重试误判为重复，从而造成真实丢消息。
+    lock_guard<mutex> lock(_mutex);
+    if (_context == nullptr || key.empty())
+    {
+        return false;
+    }
 
-返回值来自 Redis 整数结果：通常 1 表示匹配并续期成功，0 表示 key 不存在或 value 不匹配，-1 表示命令失败。业务层在心跳中如果发现不是当前 server 持有，应拒绝旧连接继续工作。
+    redisReply *reply = static_cast<redisReply *>(redisCommand(
+        _context, "DEL %b", key.data(), key.size()));
+    if (reply == nullptr)
+    {
+        return false;
+    }
+```
 
-这个设计解决的是“旧连接不能续命新会话”的问题，是面试里解释 Lua 原子性的好例子。
+投递失败后删除去重 key，让发送者用相同 message_id 重试。删除本身失败不会伪装成业务成功，日志与后续 ACK_FAIL 仍能暴露这次投递未完成。
 
-### `getUserServer(userid)`
+`NX` 让“仅当 key 不存在时写入”在 Redis 内原子完成。并发请求不需要先 GET 再 SET，因此不会出现两个节点都观察到空值并同时宣告成功的窗口。
 
-这个函数查询某个用户当前在哪个服务节点。单聊或群聊投递时，如果本地连接表找不到目标用户，就会调用它判断目标是否在其他节点。
+### 片段 5：第 100-122 行
 
-实现用 `GET key`，如果 Redis 返回字符串，就按 `reply->len` 构造 `serverId`；如果 key 不存在、连接失败或参数非法，就返回空字符串。
+```cpp
+    const bool ok = reply->type == REDIS_REPLY_INTEGER;
+    freeReplyObject(reply);
+    return ok;
+}
 
-返回空字符串并不一定表示用户永久离线，也可能是 Redis 短暂故障。因此业务层通常把它作为“无法跨节点直达”的信号，然后尝试离线落库兜底。
+int Redis::claimUserServer(int userid, const string &serverId, int ttlSeconds)
+{
+    // 登录时抢占 userId -> serverId 租约。SET NX 保证同一用户同时登录时只有一个连接成功，
+    // 解决多节点部署下“一个账号被两个连接同时认为在线”的问题。
+    lock_guard<mutex> lock(_mutex);
+    if (_context == nullptr || userid <= 0 || serverId.empty() || ttlSeconds <= 0)
+    {
+        return -1;
+    }
 
-### `removeUserServerIfMatches(userid, serverId)`
+    const string key = "chat:user:server:" + to_string(userid);
+    redisReply *reply = static_cast<redisReply *>(redisCommand(
+        _context, "SET %b %b EX %d NX", key.data(), key.size(),
+        serverId.data(), serverId.size(), ttlSeconds));
+    if (reply == nullptr)
+    {
+        return -1;
+    }
+```
 
-这个函数用于退出或断线时释放用户路由，但只在 Redis 中的 value 仍等于当前 serverId 时删除。它也使用 Lua 脚本，避免旧连接删掉新登录连接刚写入的路由。
+登录用 `SET route serverId NX EX ttl` 竞争唯一在线路由。两个节点同时登录同一账号时只有一个收到 OK，另一个收到 nil 并拒绝登录，消除了先查数据库再更新的竞态窗口。
 
-返回值语义是：1 表示匹配并删除，0 表示 value 不匹配，2 表示 key 已不存在，-1 表示执行失败。业务层可以根据“是否仍由当前节点持有”决定是否更新数据库状态为离线。
+### 片段 6：第 123-145 行
 
-这个函数和 `refreshUserServerIfMatches` 是一组：一个保护续期，一个保护删除，共同解决跨节点登录和断线竞态。
+```cpp
+    int result = -1;
+    if (reply->type == REDIS_REPLY_STATUS && reply->str != nullptr
+        && string(reply->str) == "OK")
+    {
+        result = 1;
+    }
+    else if (reply->type == REDIS_REPLY_NIL)
+    {
+        result = 0;
+    }
+    freeReplyObject(reply);
+    return result;
+}
+
+int Redis::refreshUserServerIfMatches(int userid, const string &serverId, int ttlSeconds)
+{
+    // 心跳续期必须先比较 serverId。否则旧连接延迟到达的心跳可能把新连接的租约继续延长，
+    // 造成“用户明明重新登录，却被旧连接覆盖”的状态错乱。
+    lock_guard<mutex> lock(_mutex);
+    if (_context == nullptr || userid <= 0 || serverId.empty() || ttlSeconds <= 0)
+    {
+        return -1;
+    }
+```
+
+Lua 脚本先比较当前值是否仍是本节点，再执行 EXPIRE。把比较和续期放在 Redis 内原子完成，旧连接的心跳不能延长新节点路由之外的错误状态。
+
+只有已认证连接才能续租自己的在线路由。Redis 条件续期失败可能表示路由已被新会话接管，此时当前连接不应覆盖它；心跳响应回显客户端时间戳，客户端同时获得存活确认和简单 RTT 依据。
+
+### 片段 7：第 146-172 行
+
+```cpp
+
+    // Lua 在 Redis 端原子执行 GET + EXPIRE，避免客户端分两条命令时出现竞态窗口。
+    static const char *script =
+        "if redis.call('GET', KEYS[1]) == ARGV[1] then "
+        "return redis.call('EXPIRE', KEYS[1], ARGV[2]) else return 0 end";
+    const string key = "chat:user:server:" + to_string(userid);
+    redisReply *reply = static_cast<redisReply *>(redisCommand(
+        _context, "EVAL %s 1 %b %b %d", script,
+        key.data(), key.size(), serverId.data(), serverId.size(), ttlSeconds));
+    if (reply == nullptr)
+    {
+        return -1;
+    }
+    const int result = reply->type == REDIS_REPLY_INTEGER
+                     ? static_cast<int>(reply->integer) : -1;
+    freeReplyObject(reply);
+    return result;
+}
+
+string Redis::getUserServer(int userid)
+{
+    // 查询用户当前所在服务实例。空串统一表示“无可用路由”，上层会走离线存储或本地判断。
+    lock_guard<mutex> lock(_mutex);
+    if (_context == nullptr || userid <= 0)
+    {
+        return "";
+    }
+```
+
+跨节点投递按 userId 读取当前 serverId。空字符串既表示用户没有路由，也可能表示 Redis 查询失败；ChatService 都不会盲目发布，而是把消息保存到离线表。
+
+### 片段 8：第 173-199 行
+
+```cpp
+
+    const string key = "chat:user:server:" + to_string(userid);
+    redisReply *reply = static_cast<redisReply *>(redisCommand(
+        _context, "GET %b", key.data(), key.size()));
+    if (reply == nullptr)
+    {
+        return "";
+    }
+
+    string serverId;
+    if (reply->type == REDIS_REPLY_STRING && reply->str != nullptr)
+    {
+        serverId.assign(reply->str, reply->len);
+    }
+    freeReplyObject(reply);
+    return serverId;
+}
+
+int Redis::removeUserServerIfMatches(int userid, const string &serverId)
+{
+    // 登出/连接断开时只允许持有租约的服务实例删除路由。
+    // 如果不比较 serverId，旧连接断开可能删除新登录连接的路由。
+    lock_guard<mutex> lock(_mutex);
+    if (_context == nullptr || userid <= 0 || serverId.empty())
+    {
+        return -1;
+    }
+```
+
+登出和断线使用 Lua 条件删除：仅当 key 的值仍等于当前 serverId 才 DEL。返回 0 意味着路由已不存在或已被接管，调用者不能据此把数据库状态覆盖为 offline。
+
+### 片段 9：第 200-220 行
+
+```cpp
+
+    // 返回值区分三种情况：1=删除成功，2=原本不存在，0=属于其他实例。
+    // 业务层可以据此判断是否需要更新数据库在线状态。
+    static const char *script =
+        "local current = redis.call('GET', KEYS[1]); "
+        "if not current then return 2 end; "
+        "if current == ARGV[1] then return redis.call('DEL', KEYS[1]) end; "
+        "return 0";
+    const string key = "chat:user:server:" + to_string(userid);
+    redisReply *reply = static_cast<redisReply *>(redisCommand(
+        _context, "EVAL %s 1 %b %b", script,
+        key.data(), key.size(), serverId.data(), serverId.size()));
+    if (reply == nullptr)
+    {
+        return -1;
+    }
+    const int result = reply->type == REDIS_REPLY_INTEGER
+                     ? static_cast<int>(reply->integer) : -1;
+    freeReplyObject(reply);
+    return result;
+}
+```
+
+这部分完成“Redis 原子状态实现”中的边界分支：无效输入或外部操作失败会在写入后续状态前结束，成功路径才把结果交给相邻模块。这样返回值不仅代表函数结束，还决定上层能否发送成功响应或继续投递。
 
 ## 面试重点
 
-重要性最高。重点准备 Redis 原子性、Lua 的必要性、TTL 心跳续期、故障降级和同步连接锁的吞吐瓶颈。可能追问：Redis 主从切换是否绝对避免双登录？不能保证所有故障模型下线性一致，严格需求需更强一致性存储或 fencing token。
+- 能否沿着一条单聊消息说明本地直发、跨节点路由、离线落库、ACK 与重试之间的成功语义？
+
+- Redis 或 RabbitMQ 故障时系统如何降级，哪些保证仍成立，哪些保证会变弱？
+
+- 为什么“至少一次发送 + message_id 幂等”不等于严格 Exactly Once？

@@ -2,55 +2,151 @@
 
 ## 作用概览
 
-这是轻量 C++ 单元测试程序，不引入测试框架，通过异常断言验证帧协议、本地去重并发性和环境配置解析。
+**核心单元测试。** 不启动外部服务，直接验证帧长度边界、本地去重的 TTL/并发行为以及环境配置解析。这些测试失败通常表示基础组件契约被破坏。
 
-## 按学习顺序讲解
+阅读位置：`test/core_tests.cpp`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-- `expect(condition,message)`：条件不成立时抛出 `runtime_error`，使进程非零退出并被 CTest 判为失败。
-- `testFrameProtocol()`：验证编码后总长度、网络序长度解码、payload 保真、0/超大长度拒绝和空 payload 异常。
-- `testDedup()`：验证首次/重复判断、LRU 容量淘汰、`forget` 撤销和空 ID 兼容。
-- `testConcurrentDedup()`：32 个线程同时检查同一个 ID，断言只有一个线程看到“新消息”，证明互斥保护生效。
-- `testConfig()`：验证字符串默认值、环境覆盖、整数解析和非法整数回退。
-- `main()`：按从基础协议到并发与配置的顺序执行全部测试，成功时打印统一结果。
+## 代码片段与详细讲解
 
-## 函数详细说明
+### 片段 1：第 1-28 行
 
-### `expect(bool condition, const string &message)`
+```cpp
+#include "config.hpp"
+#include "frameprotocol.hpp"
+#include "msgdedup.hpp"
 
-这是整个测试文件的最小断言工具。条件为 true 时直接返回；条件为 false 时抛出带说明文字的 `runtime_error`。异常会向上传到 `main`，使测试进程以失败状态结束，CTest 因此能判定用例未通过。相比只打印错误，这种写法不会让失败测试继续假装成功。
+#include <cstdlib>
+#include <atomic>
+#include <iostream>
+#include <stdexcept>
+#include <thread>
+#include <vector>
 
-它没有测试框架提供的源码位置、期望值对比和独立用例统计，因此适合当前少量纯逻辑验证；测试继续增长时应换成 GoogleTest/Catch2，或至少把实际值加入错误信息。
+static void expect(bool condition, const char *message)
+{
+    if (!condition)
+    {
+        throw std::runtime_error(message);
+    }
+}
 
-### `testFrameProtocol()`
+static void testFrameProtocol()
+{
+    const std::string payload = R"({"msgid":1,"name":"测试"})";
+    const std::string frame = chatserver::protocol::encodeFrame(payload);
+    expect(frame.size() == chatserver::protocol::FRAME_HEADER_LEN + payload.size(), "frame size mismatch");
+    expect(chatserver::protocol::decodeFrameLength(frame.data()) == payload.size(), "frame length decode mismatch");
+    expect(frame.substr(chatserver::protocol::FRAME_HEADER_LEN) == payload, "frame payload mismatch");
+    expect(!chatserver::protocol::isValidPayloadLength(0), "empty payload must be invalid");
+    expect(!chatserver::protocol::isValidPayloadLength(chatserver::protocol::FRAME_MAX_PAYLOAD + 1), "oversized payload must be invalid");
+```
 
-该函数围绕长度帧协议做正反两类验证。正向部分准备一个包含中文或普通字段的 JSON payload，调用编码函数后检查总字节数是否等于“4 字节头 + 正文长度”，再解码头部并确认长度和值都与原文一致。这证明编码、网络字节序转换和正文拼接能互相还原。
+帧测试先编码含中文的 JSON，检查总长度、解出的正文长度和原 payload 完全一致；随后分别验证长度 0、超过 4 MB 和空字符串编码会被拒绝。中文让测试同时覆盖“字节长度不能按字符数计算”这一边界。
 
-反向部分检查长度为 0、超过最大限制以及空 payload 等边界是否被拒绝。测试的重点不是 TCP 行为，而是公共协议函数的确定性规则；真实拆包和粘包还要通过 socket 集成测试覆盖。
+读取先确认长度头完整，再判断正文是否已经收齐；不足时保留 Buffer 原状等待下一批字节。只有长度合法且正文完整才前移读指针，这同时处理了半包和一次到达多帧的粘包情况。
 
-### `testDedup()`
+### 片段 2：第 29-56 行
 
-函数创建容量受限的本地 `MsgDedup`。同一 ID 第一次检查应返回“非重复”，第二次应返回“重复”；插入超过容量的多个 ID 后，再验证最旧记录会按 LRU/容量策略淘汰。随后调用 `forget`，确认撤销标记后相同 ID 可以重新作为新消息处理。
+```cpp
 
-测试还覆盖空字符串兼容行为，避免旧客户端没有 `message_id` 时所有消息都被错误合并。这里验证的是单进程内存去重，不能替代 Redis 跨节点原子去重和 TTL 测试。
+    bool emptyRejected = false;
+    try
+    {
+        chatserver::protocol::encodeFrame("");
+    }
+    catch (const std::length_error &)
+    {
+        emptyRejected = true;
+    }
+    expect(emptyRejected, "empty payload was not rejected");
+}
 
-### `testConcurrentDedup()`
+static void testDedup()
+{
+    MsgDedup dedup(2, 120);
+    expect(!dedup.isDuplicate("a"), "first a must be new");
+    expect(dedup.isDuplicate("a"), "second a must be duplicate");
+    expect(!dedup.isDuplicate("b"), "first b must be new");
+    expect(!dedup.isDuplicate("c"), "first c must be new");
+    expect(dedup.isDuplicate("b"), "b must still be cached");
+    // Inserting c evicted a, which was then the least-recently-used entry.
+    expect(!dedup.isDuplicate("a"), "evicted a must be new");
+    dedup.forget("a");
+    expect(!dedup.isDuplicate("a"), "forgotten a must be accepted again");
+    expect(!dedup.isDuplicate(""), "empty id must not deduplicate");
+    expect(!dedup.isDuplicate(""), "empty id must remain non-deduplicated");
+}
+```
 
-函数创建多个线程，让它们几乎同时对同一个消息 ID 调用去重检查。每个线程只有在看到“第一次出现”时才增加原子计数，全部 `join` 后断言计数恰好为 1。若内部“查询 + 插入”没有被同一把锁保护，多个线程可能同时认为 ID 不存在，计数就会大于 1。
+容量设为 2 后依次访问 a、b、c：第二次 a 必须重复，插入 c 时最久未使用的 a 被淘汰，而刚访问过的 b 仍在；forget(a) 后同 id 再次被接受，空 id 连续两次都不占缓存。
 
-该测试能发现明显的数据竞争和非原子逻辑，但线程启动时刻不完全一致，单次成功不构成形式证明。可通过启动屏障、重复运行和 ThreadSanitizer 提高发现竞态的概率。
+### 片段 3：第 57-80 行
 
-### `testConfig()`
+```cpp
 
-函数验证配置读取的优先级和容错。先检查环境变量不存在时返回调用方提供的默认字符串；再临时设置变量，确认环境值覆盖默认值。整数路径还要验证合法数字能被转换，而非法文本不会抛出到业务层，而是回退到默认整数。
+static void testConcurrentDedup()
+{
+    MsgDedup dedup(128, 120);
+    std::atomic<int> firstSeen{0};
+    std::vector<std::thread> workers;
+    workers.reserve(32);
 
-测试结束应恢复或删除自己设置的环境变量，避免影响同一进程后续用例。它验证的是解析工具，不代表 `.env`、容器编排或操作系统层面的配置已经正确部署。
+    for (int i = 0; i < 32; ++i)
+    {
+        workers.emplace_back([&dedup, &firstSeen]() {
+            if (!dedup.isDuplicate("same-message-id"))
+            {
+                ++firstSeen;
+            }
+        });
+    }
+    for (auto &worker : workers)
+    {
+        worker.join();
+    }
 
-### `main()`
+    expect(firstSeen == 1, "concurrent duplicate check must accept exactly one message");
+}
+```
 
-入口按帧协议、基本去重、并发去重和配置解析的顺序执行所有测试。任一 `expect` 抛异常都会使程序失败；全部完成后打印统一通过提示并返回 0。顺序从无外部状态的纯协议开始，出现失败时更容易定位基础组件问题。
+32 个线程共享同一个 MsgDedup，并同时检查完全相同的 id。每个线程只在返回“首次出现”时递增原子计数，最终必须恰好为 1，直接验证查找与登记处于同一临界区。
 
-由于所有用例共享一个进程，若未来增加全局单例或环境状态测试，需要保证每个函数自行清理，避免前一个用例改变后一个用例结果。
+并发操作在等待器或收集器就绪后同时启动，避免响应太快而被测试代码错过。这里关注的是共享状态竞争：例如重复登录只能有一个赢家，或多连接突发发送后每组仍必须收齐自己的消息。
+
+### 片段 4：第 81-103 行
+
+```cpp
+
+static void testConfig()
+{
+    unsetenv("CHAT_TEST_VALUE");
+    expect(chatserver::config::envOr("CHAT_TEST_VALUE", "fallback") == "fallback", "environment fallback failed");
+    setenv("CHAT_TEST_VALUE", "configured", 1);
+    expect(chatserver::config::envOr("CHAT_TEST_VALUE", "fallback") == "configured", "environment override failed");
+
+    setenv("CHAT_TEST_PORT", "7000", 1);
+    expect(chatserver::config::envIntOr("CHAT_TEST_PORT", 6000) == 7000, "integer environment override failed");
+    setenv("CHAT_TEST_PORT", "invalid", 1);
+    expect(chatserver::config::envIntOr("CHAT_TEST_PORT", 6000) == 6000, "invalid integer fallback failed");
+}
+
+int main()
+{
+    testFrameProtocol();
+    testDedup();
+    testConcurrentDedup();
+    testConfig();
+    std::cout << "chat_core_tests: all assertions passed" << std::endl;
+    return 0;
+}
+```
+
+配置测试依次覆盖未设置字符串、字符串覆盖、合法整数和非法整数四种状态。非法 `7000` 之外的文本必须回到默认 6000，证明解析失败不会把端口静默变成 0。
 
 ## 面试重点
 
-重要性高。常见问题：这个测试证明了什么、没证明什么？它证明纯函数与进程内锁行为，不覆盖 Redis 原子性、真实 TCP 粘包、数据库或 RabbitMQ；为何并发测试仍可能不足？线程调度不可控，可增加重复轮次、屏障和 ThreadSanitizer。
+- 测试准备了什么外部状态或模拟组件，实际动作经过哪些模块？
+
+- 每个断言证明的是返回值正确，还是“不丢、不重、不乱序、不可冒用”等系统性质？
+
+- 如何避免测试自身的等待竞态和上轮残留状态造成假失败？

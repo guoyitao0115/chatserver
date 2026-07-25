@@ -2,52 +2,144 @@
 
 ## 作用概览
 
-该脚本验证离线消息所依赖的 MySQL 中断时，服务端必须返回失败 ACK，并在数据库恢复后允许同一 `message_id` 重试且只保存一份。
+**MySQL 故障测试。** 在数据库不可用窗口执行依赖持久化的操作，确认失败被明确反馈且服务进程不崩溃；恢复后再次操作，验证连接是按请求重建而非永久失效。
 
-## 按学习顺序讲解
+阅读位置：`web/test/chaos-mysql.mjs`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-- `trackedClient(port)`：创建并登记测试连接。
-- 注册并登录发送者/接收者，然后让接收者离线，强制后续消息走离线表。
-- 打印 `READY_FOR_MYSQL_STOP`，外层脚本暂停 MySQL。
-- 发送固定 ID 消息，断言 `ack_state=2`；这证明落库失败未被谎报成功。
-- 打印恢复标记并等待数据库重启；用完全相同 payload 重发，断言 ACK_OK。
-- 接收者重登，断言离线列表中恰好一份，验证失败路径撤销去重标记而恢复路径仍幂等。
-- `finally` 关闭连接。
+## 代码片段与详细讲解
 
-## 函数详细说明
+### 片段 1：第 1-22 行
 
-### `trackedClient(port)`
+```javascript
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 
-使用公共工厂创建客户端并加入 Set。MySQL 停机期间请求可能超时或断言失败，统一跟踪保证 finally 仍能关闭已建立的 WebSocket，不让故障测试污染下一轮环境。
+import { MSG, createClient, delay, login, parseEmbedded, register } from './e2e-client.mjs';
 
-### 场景初始化与强制离线路径
+// MySQL 故障测试需要配合外部脚本停止/启动数据库容器。
+// 本脚本通过 READY_FOR_MYSQL_STOP/START 日志把“停库窗口”暴露给编排脚本。
+const port1 = Number(process.env.CHAT_E2E_PORT_1 ?? 8080);
+const port2 = Number(process.env.CHAT_E2E_PORT_2 ?? 8081);
+const timeoutMs = Number(process.env.CHAT_CHAOS_TIMEOUT_MS ?? 30_000);
+const outageWaitMs = Number(process.env.CHAT_CHAOS_OUTAGE_WAIT_MS ?? 15_000);
+const recoveryWaitMs = Number(process.env.CHAT_CHAOS_RECOVERY_WAIT_MS ?? 20_000);
+const suffix = `${Date.now()}-${crypto.randomInt(1000, 9999)}`;
+const password = 'mysql-chaos-demo-123';
+const clients = new Set();
 
-发送者、接收者在两个端口注册并登录。随后接收者主动注销，短暂等待服务端清理路由，关闭连接并从 Set 删除。这样后面的消息无法通过本地连接或跨节点 MQ 在线送达，只能尝试 MySQL 离线表，数据库故障才会直接影响 ACK。
+// 记录连接用于 finally 统一清理，避免故障测试异常退出后留下在线用户。
+async function trackedClient(port) {
+  const client = await createClient(port, { timeoutMs });
+  clients.add(client);
+  return client;
+}
+```
 
-如果接收者路由尚未清除，消息可能仍被发布到旧节点并改变预期路径，因此理想协议应等待注销 ACK 或查询路由状态，当前用 300ms 作为简化同步。
+新建连接后立即加入统一集合，保证测试在任意断言处抛错时仍能在 finally 中找到并关闭它；这避免失败用例留下在线用户影响下一轮重复登录判断。
 
-### MySQL 停机同步点
+外部脚本在 READY 标记后停止或恢复 MySQL。本段故意执行需要落库/查询的操作，要求故障时得到明确失败且进程仍可响应；恢复窗口结束后重新建立客户端操作，证明模型按请求新建连接而非永久持有坏连接。
 
-脚本打印 `READY_FOR_MYSQL_STOP` 和等待时长，外层 Shell 收到后暂停数据库；delay 给停机动作留出窗口。Node 脚本不绑定 Docker 或本机服务命令，因此可以在不同部署环境复用。外层应负责确认数据库确实不可用。
+这些依赖明确了本片段所在层的边界：MySQL C API、密码或随机数、断言框架。项目内部头文件提供协议和领域对象，外部库只承担基础能力；业务数据如何流转仍由当前模块决定。
 
-### 首次发送与失败 ACK
+本片段读取 `CHAT_E2E_PORT_1`、`CHAT_E2E_PORT_2`、`CHAT_CHAOS_TIMEOUT_MS`、`CHAT_CHAOS_OUTAGE_WAIT_MS`、`CHAT_CHAOS_RECOVERY_WAIT_MS`。未设置时采用紧邻的本机默认值；容器部署则覆盖这些值，因此同一二进制可以作为不同节点运行，无需重新编译。
 
-构造固定 payload 后发送，等待同 message ID 的 ACK，并要求 `ack_state === 2`。因为目标已离线，服务端只有成功写入离线表才能宣称接受；数据库写失败时返回 ACK_FAIL，避免发送者误以为消息已可靠保存。
+### 片段 2：第 23-52 行
 
-失败路径还必须撤销 Redis/本地去重标记，否则恢复后用同一 ID 重试会得到 ACK_DEDUP，但数据库其实没有这条消息，形成永久丢失。
+```javascript
 
-### 数据库恢复与同 ID 重试
+try {
+  // 先准备一个在线发送者和一个即将离线的接收者。
+  // 接收者离线后，单聊必须写入离线消息表，因此能直接验证数据库写入失败处理。
+  const sender = await trackedClient(port1);
+  let receiver = await trackedClient(port2);
+  const senderId = await register(sender, `数据库故障发送-${suffix}`, password, timeoutMs);
+  const receiverId = await register(receiver, `数据库故障接收-${suffix}`, password, timeoutMs);
+  assert.equal((await login(sender, senderId, password, timeoutMs)).errno, 0);
+  assert.equal((await login(receiver, receiverId, password, timeoutMs)).errno, 0);
+  receiver.send({ msgid: MSG.LOGOUT, id: receiverId });
+  await delay(300);
+  receiver.close();
+  clients.delete(receiver);
 
-脚本输出 `READY_FOR_MYSQL_START`，由外层恢复数据库并等待连接池可重新建立。随后原样重发同一个 payload，而不是生成新 ID。预期 ACK_OK，证明失败标记已撤销且服务端能够在依赖恢复后重新执行持久化。
+  // 通知外部脚本可以停止 MySQL，然后等待数据库真正进入不可用状态。
+  console.log(`READY_FOR_MYSQL_STOP wait_ms=${outageWaitMs}`);
+  await delay(outageWaitMs);
 
-### 重登与 exactly-once 范围验证
+  // 数据库不可用时发送离线消息，服务端应该返回 ACK_FAIL，而不是假装成功。
+  // 这能避免“发送方看到成功，但消息实际上没有落库”的数据一致性问题。
+  const messageId = `mysql-outage-${suffix}`;
+  const payload = {
+    msgid: MSG.ONE_CHAT,
+    id: senderId,
+    toid: receiverId,
+    name: `数据库故障发送-${suffix}`,
+    msg: '数据库中断后应返回失败并允许重试',
+    time: new Date().toISOString(),
+    sent_at_ms: Date.now(),
+```
 
-重新创建接收者客户端并登录，解析离线列表，筛选目标 ID，要求数量恰好为 1。0 份说明恢复后仍丢失，大于 1 说明失败/重试路径产生重复持久化。这里的“一份”只针对该受控故障流程，不等于任意崩溃窗口下的全局 exactly-once。
+场景断言同时观察协议响应和对端实际结果：仅有发送成功或 ACK 并不足以证明消息送达。数量、字段、错误码或“观察窗口内没有额外消息”共同限定了本片段要验证的系统性质。
 
-### 结果与 `finally`
+### 片段 3：第 53-82 行
 
-输出失败 ACK、恢复 ACK、恢复份数和消息 ID，便于自动报告。finally 关闭所有仍在 Set 的连接；已经关闭的旧 receiver 被提前删除，重连 receiver 被重新登记。
+```javascript
+    client_seq: 1,
+    message_id: messageId,
+  };
+  sender.send(payload);
+  const failedAck = await sender.waitFor(
+    (message) => message.msgid === MSG.ACK && message.message_id === messageId,
+    timeoutMs,
+  );
+  assert.equal(failedAck.ack_state, 2, 'database write failure must return ACK_FAIL');
+
+  // 通知外部脚本恢复 MySQL。使用相同 message_id 重试是关键：失败请求不能提前写入去重表，
+  // 否则恢复后会被误判成重复消息。
+  console.log(`READY_FOR_MYSQL_START wait_ms=${recoveryWaitMs}`);
+  await delay(recoveryWaitMs);
+
+  sender.send(payload);
+  const recoveredAck = await sender.waitFor(
+    (message) => message.msgid === MSG.ACK && message.message_id === messageId,
+    timeoutMs,
+  );
+  assert.equal(recoveredAck.ack_state, 0, 'same message id must be accepted after storage recovers');
+
+  // 接收者重新登录后应该只看到一份恢复后的离线消息，证明重试成功且没有重复落库。
+  receiver = await trackedClient(port2);
+  const relogin = await login(receiver, receiverId, password, timeoutMs);
+  assert.equal(relogin.errno, 0);
+  const recoveredMessages = parseEmbedded(relogin.offlinemsg).filter(
+    (message) => message.message_id === messageId,
+  );
+  assert.equal(recoveredMessages.length, 1, 'recovered message must be stored exactly once');
+```
+
+`message_id` 贯穿发送、ACK、重试和接收去重：同一业务消息重发时 id 不变，服务端才能识别重复；`ack_state` 则告诉发送者是已接受、已去重还是处理失败，而不是仅凭 TCP 写成功判断业务成功。
+
+### 片段 4：第 83-94 行
+
+```javascript
+
+  console.log(JSON.stringify({
+    status: 'passed',
+    failedAckState: failedAck.ack_state,
+    recoveredAckState: recoveredAck.ack_state,
+    recoveredCopies: recoveredMessages.length,
+    messageId,
+  }, null, 2));
+} finally {
+  // 故障路径上任何一步失败都要释放连接，让下一轮测试能从干净在线状态开始。
+  for (const client of clients) client.close();
+}
+```
+
+`finally` 会遍历本轮登记的客户端并关闭连接。即使中途断言抛错，服务端也能触发断线清理，避免残留在线路由让下一轮重复登录或离线场景得到假结果。
 
 ## 面试重点
 
-重要性最高。常见问题：为什么失败后必须删除 Redis 去重键？否则相同 ID 重试会被当成重复并永远丢失；为什么用相同 ID 而不是新 ID？验证真正的重试语义。
+- 测试准备了什么外部状态或模拟组件，实际动作经过哪些模块？
+
+- 每个断言证明的是返回值正确，还是“不丢、不重、不乱序、不可冒用”等系统性质？
+
+- 如何避免测试自身的等待竞态和上轮残留状态造成假失败？

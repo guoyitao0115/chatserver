@@ -2,85 +2,141 @@
 
 ## 作用概览
 
-该文件声明网络接入层 `ChatServer`。它管理 Muduo TCP 服务、帧解码、连接活动时间和半包超时，但不承载具体聊天业务。
+**网络层接口与连接状态。** 声明 Muduo 服务器回调、帧解码器以及半包/空闲连接巡检所需的时间表。它把 TCP 生命周期交给 `ChatServer`，把已解出的 JSON 业务交给 `ChatService`。
 
-## 按学习顺序讲解
+阅读位置：`include/server/chatserver.hpp`。下文严格按源码顺序展示，每一行只出现一次；解释只针对紧邻的代码片段。
 
-### `ChatServer(loop, listenAddr, nameArg)`
+## 代码片段与详细讲解
 
-构造服务器并注册连接、读事件与完整帧回调，同时安排周期性空闲/半包巡检。
+### 片段 1：第 1-25 行
 
-### `start()`
+```cpp
+#ifndef CHATSERVER_H
+#define CHATSERVER_H
 
-启动 Muduo 的监听和 I/O 线程。
+/*
+ * ChatServer 是网络接入层，负责管理 Muduo TCP 服务和协议边界，不承载具体聊天业务：
+ * - onMessage() 记录连接活跃度，并把字节流交给 FrameCodec 拆帧；
+ * - onFrameMessage() 只接收完整 JSON，完成基础格式校验后按 msgid 分派给 ChatService；
+ * - 定时巡检半包与空闲连接，限制慢速发送和失活会话占用资源。
+ *
+ * ChatServer 与传入 EventLoop 具有相同生命周期。构造完成后应在 EventLoop 所在线程
+ * 调用 start()，随后由 Muduo 的 I/O 线程触发回调。业务发送统一使用 FrameCodec，
+ * 不能绕过长度头直接发送裸 JSON。
+ */
 
-### `onConnection(conn)`
+#include <muduo/net/TcpServer.h>
+#include <muduo/net/TcpConnection.h>
+#include <muduo/net/EventLoop.h>
+#include <muduo/base/Logging.h>
+#include <unordered_map>
+#include <mutex>
+#include <chrono>
+#include <memory>
+#include "framecodec.hpp"   // 帧编解码器
+using namespace muduo;
+using namespace muduo::net;
+```
 
-处理连接建立/断开：维护活动记录，断开时清理状态并通知 `ChatService` 释放登录用户。
+这些头文件把“网络层接口与连接状态”接到项目公共协议、领域对象和所需系统库。依赖方向保持从实现到接口：模型不知道网络连接，帧工具不知道用户业务，当前文件负责在自己的层内组合它们。
 
-### `onMessage(conn, buffer, timestamp)`
+### 片段 2：第 26-49 行
 
-记录最新活动时间，把 Muduo Buffer 交给 `FrameCodec` 尽可能拆出完整帧，并根据剩余数据更新“半包开始时间”。
+```cpp
 
-### `onFrameMessage(conn, payload, timestamp)`
+// 聊天服务器的主类
+class ChatServer
+{
+public:
+    /**
+     * 绑定监听地址、连接回调、字节流回调以及定时巡检任务。
+     * loop 由外部拥有，必须非空且存活时间长于本对象；listenAddr/nameArg 分别用于
+     * 创建监听 socket 和标识服务实例。构造函数只配置 TcpServer，不开始监听。
+     */
+    ChatServer(EventLoop *loop,
+               const InetAddress &listenAddr,
+               const string &nameArg);
 
-只接收完整 JSON 负载；校验 `msgid` 后从业务层取得 handler。解析失败返回统一 400 错误，不让异常终止 I/O 线程。
+    // 启动监听和 I/O 线程池；EventLoop::loop() 仍由 main 等外层代码负责运行。
+    void start();
 
-### `checkIdleConnections()`
+private:
+    /**
+     * TCP 连接建立/关闭回调。
+     * 建立时登记最后活跃时间；关闭时清理半包、活跃度记录，并通知 ChatService 释放
+     * 用户连接映射、在线路由和数据库状态。conn 是 Muduo 共享所有权句柄。
+     */
+    void onConnection(const TcpConnectionPtr &);
+```
 
-关闭超过 45 秒无业务/心跳的连接。先在锁内收集目标，锁外断开，缩短临界区。
+这里固定模块需要长期保存的状态。这些成员把跨回调信息留在对象生命周期内；实现文件中的锁和清理逻辑必须围绕它们保持一致。
 
-### `checkPartialFrameTimeouts()`
+### 片段 3：第 50-73 行
 
-关闭连续 10 秒仍未收齐的帧，防御慢速连接长期占用内存和连接资源。
+```cpp
 
-## 函数详细说明
+    /**
+     * TCP 数据到达回调。每次读事件先更新活跃时间，再在解码前后维护半包起始时间，
+     * 最后由 FrameCodec 从 Buffer 中按顺序取出 0..N 个完整帧。
+     * Buffer 归 Muduo 所有，只能在回调期间访问；本函数不会把其裸指针保存到成员中。
+     */
+    void onMessage(const TcpConnectionPtr &,
+                   Buffer *,
+                   Timestamp);
 
-### `ChatServer(EventLoop *loop, const InetAddress &listenAddr, const string &nameArg)`
+    /**
+     * 完整帧回调：解析 JSON 并验证 msgid 为整数，然后取得业务处理器同步调用。
+     * JSON 格式错误会返回统一 400 错误帧，而不会让异常逃出 I/O 回调导致服务退出。
+     * 这里只验证公共信封，用户身份和具体字段仍由 ChatService 校验。
+     */
+    void onFrameMessage(const TcpConnectionPtr &conn,
+                        const string &payload,
+                        Timestamp time);
 
-- **参数**：事件循环必须在服务器生命周期内有效；监听地址决定绑定 IP/端口；名称用于 Muduo 日志与连接命名。
-- **初始化职责**：构造 `TcpServer`，把 codec 的完整帧回调绑定到 `onFrameMessage`，注册连接和读事件回调，并安排空闲连接与半包周期巡检。
-- **对象关系**：`ChatServer` 拥有 `TcpServer` 和 `FrameCodec`，但只借用 `EventLoop*`。
+    // 半包超时巡检：收集超过阈值的弱引用，释放互斥锁后再 shutdown，避免锁内回调。
+    void checkPartialFrameTimeouts();
 
-### `start()`
+    // 空闲连接巡检：任何有效 TCP 流量都会刷新计时；超时后异步关闭连接。
+    void checkIdleConnections();
+```
 
-- **输入/返回**：无参数、无返回。
-- **副作用**：启动 Muduo 的监听 socket 和线程池。事件循环仍需由进程入口调用 `loop.loop()` 才会持续处理事件。
-- **调用位置**：仅由服务端 `main` 在所有回调配置完成后调用。
+这一接口片段规定“网络层接口与连接状态”对外可用的操作和对象必须长期保存的状态。调用者只依赖这里的契约；锁、SQL、网络错误和资源释放留在实现内部，因此更换基础设施不会迫使业务处理器改写所有调用点。
 
-### `onConnection(const TcpConnectionPtr &conn)`
+### 片段 4：第 74-95 行
 
-- **建立分支**：记录连接最近活动时间和弱引用，供 45 秒空闲巡检。
-- **断开分支**：删除活动、半包跟踪项，再通知业务层清理用户连接、Redis 路由和数据库状态。
-- **并发点**：两个跟踪表分别有互斥锁；弱引用避免巡检表意外延长连接生命周期。
+```cpp
 
-### `onMessage(conn, Buffer *buffer, Timestamp time)`
+    TcpServer  _server;  // 拥有监听器和 I/O 线程池，析构时由 Muduo 清理底层资源
+    EventLoop *_loop;    // 非拥有指针，仅用于注册定时任务；生命周期由启动入口保证
 
-- **输入**：可能是半个帧、一个完整帧或多个粘连帧，不能假设一次回调等于一条消息。
-- **流程**：刷新活动时间 → codec 尽量解码 → 检查剩余 Buffer 是否为“合法长度头已到但正文不足” → 新增或清除半包起始时间。
-- **副作用**：可能触发零到多次业务处理；不会把不完整正文交给 JSON 解析器。
-- **安全性**：半包计时只在真正不完整时开始，避免正常空 Buffer 被误判。
+    // 帧编解码器：解决TCP粘包/拆包问题
+    FrameCodec _codec;
 
-### `onFrameMessage(conn, payload, time)`
+    // 半包从首次观察到残留字节开始计时；持续补充少量数据不会无限刷新此期限。
+    static constexpr int PARTIAL_FRAME_TIMEOUT_SEC = 10;
+    // 正常客户端心跳周期为 10 秒，45 秒容忍多次抖动后才清理连接。
+    static constexpr int IDLE_CONNECTION_TIMEOUT_SEC = 45;
 
-- **输入**：codec 已保证 payload 边界完整，但内容仍可能不是合法 JSON。
-- **流程**：解析 JSON → 要求顶层是对象且 `msgid` 是整数 → 获取 handler → 执行业务函数。
-- **错误路径**：结构错误或解析异常均返回 `ERROR_MSG`、HTTP 风格 400 码；日志只截取 payload 前 200 字符，避免异常大日志。
-- **分层**：该函数是网络层进入业务层的唯一主要入口。
+    // key 使用 Muduo 唯一连接名；weak_ptr 避免巡检表延长已关闭连接的生命周期。
+    unordered_map<string, pair<chrono::steady_clock::time_point, weak_ptr<TcpConnection>>> _partialFrameStart;
+    // 记录最近一次收到流量的时间，用 steady_clock 避免系统时间校准造成误判。
+    unordered_map<string, pair<chrono::steady_clock::time_point, weak_ptr<TcpConnection>>> _lastActivity;
+    // 两张表分锁，降低数据接收与定时巡检相互阻塞；不得在持锁时执行网络关闭。
+    mutex _partialFrameMutex;
+    mutex _activityMutex;
+};
 
-### `checkIdleConnections()`
+#endif
+```
 
-- **判断依据**：当前稳态时钟减去最后活动时间达到 45 秒。
-- **锁策略**：锁内遍历、删除并把可用弱引用提升成强引用；锁外执行 `shutdown`，避免断连回调重入时持锁。
-- **结果**：客户端业务流量或心跳都会刷新活动时间；真正失联连接最终被释放。
+互斥区保护 `共享状态` 的一致性。这里需要关注的不只是单个容器不崩溃，还要保证成对索引或链表/哈希表同步更新，其他 I/O 线程不会观察到一半完成的状态。
 
-### `checkPartialFrameTimeouts()`
-
-- **判断依据**：连接从首次进入半包状态起超过 10 秒仍未补齐。
-- **处理**：锁内收集连接并删除记录，锁外断开。即使弱引用已失效也清理表项。
-- **防护目标**：应对慢速发送/异常客户端长期只发长度头或少量正文，而不是替代普通空闲超时。
-
+到这里，前面定义的组件被真正启动：监听器接管新连接，事件循环或异步任务持续运行。启动顺序保证回调和资源先准备好再接收流量，退出路径则负责释放连接或复位可恢复状态。
 
 ## 面试重点
 
-重要性高。常见问题：为什么网络层与业务层分开？便于协议解析、并发模型和业务规则独立演进；为何成员表保存 `weak_ptr`？巡检表不应延长连接生命周期；为什么不能在持锁时 `shutdown`？可能触发回调并放大锁竞争或死锁风险。
+- TCP 为什么必须自行处理半包和粘包，4 字节长度头如何完成增量解码？
+
+- WebSocket 帧与后端 TCP 长度帧的边界分别在哪里，网关为什么不能承担最终鉴权？
+
+- 最大帧长、半包超时和空闲超时各自防什么问题？
