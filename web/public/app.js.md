@@ -11,6 +11,8 @@
 ### 片段 1：第 1-30 行
 
 ```javascript
+import { MessageIdDeduplicator } from './message-dedup.js';
+
 // 轻量浏览器客户端：不引入框架，用一个集中 state 管理连接、会话、消息与重试状态。
 // 浏览器只通过同源 /ws 与网关通信；所有身份鉴权、权限判断、持久化和分布式去重仍由后端负责。
 
@@ -52,6 +54,8 @@ const state = {
   // messages: conversationKey -> 消息数组；pending: message_id -> 等待 ACK 的发送上下文。
   messages: new Map(),
   pending: new Map(),
+  // RabbitMQ 重投、确认超时后的离线兜底可能产生重复副本；最终展示层按全局 message_id 拦截。
+  receivedMessageIds: new MessageIdDeduplicator(10_000),
   // sequence 为每个会话单独维护递增 client_seq，用于同一发送方、同一会话的顺序判断。
   sequence: new Map(),
   heartbeatTimer: null,
@@ -79,7 +83,9 @@ function showToast(message) {
 }
 ```
 
-这一状态段把连接存活、待确认消息和后台定时器分开保存。重连不会凭空确认旧消息，停止任务时也会清除 interval；ACK、超时和关闭事件分别修改自己负责的字段，避免一个布尔量同时代表多种状态。
+`receivedMessageIds` 独立于每个会话的消息数组：同一个 ID 即使通过 RabbitMQ 在线路径
+和 MySQL 离线路径到达，或携带错误会话字段，也只能进入页面状态一次。容量限制避免
+浏览器标签长期运行时集合无限增长。
 
 ### 片段 3：第 60-90 行
 
@@ -254,16 +260,17 @@ function storeIncoming(message, notify = true) {
   const key = conversationKey(message);
   if (!state.messages.has(key)) state.messages.set(key, []);
   const bucket = state.messages.get(key);
-  // message_id 是端到端幂等键。即使服务端或网络重放同一消息，页面也只展示一份。
-  // 老版本不带 message_id 的消息无法可靠去重，因此仍按普通消息保存。
-  if (message.message_id && bucket.some((item) => item.message_id === message.message_id)) return;
+  // 使用独立有界集合而非扫描当前会话数组：同一 ID 即使从在线和离线两条路径到达，
+  // 或携带异常会话字段，也只能进入展示状态一次。旧消息没有 ID 时继续兼容显示。
+  if (state.receivedMessageIds.isDuplicate(message.message_id)) return;
   bucket.push({ ...message, delivery: '已送达' });
   if (activeKey() === key) renderMessages();
   else if (notify) showToast(`收到 ${message.name ?? message.id} 的新消息`);
 }
 ```
 
-消息不是直接追加到当前 DOM，而是先按会话 key 写入 `state.messages`。这样收到非当前联系人或群的消息也不会丢；切换会话时从状态重新渲染，并按 message_id 合并 ACK 状态，防止重试副本出现两条气泡。
+消息先经过全局 ID 去重，再按会话 key 写入 `state.messages`。使用独立 Map 后，检查从
+原来的会话数组 O(n) 扫描变成平均 O(1)，也能覆盖跨在线/离线路径的重复。
 
 循环遍历 `messages`，把每个元素独立转换、投递或校验。结果按遍历顺序追加，某个元素失败时由本片段的状态变量或断言记录，不能用一次总体成功掩盖单项失败。
 
@@ -590,13 +597,15 @@ $('#logout-button').addEventListener('click', () => {
   state.active = null;
   state.messages.clear();
   state.pending.clear();
+  state.receivedMessageIds.clear();
   chatView.classList.add('hidden');
   authView.classList.remove('hidden');
   authMessage.textContent = '已安全退出';
 });
 ```
 
-页面先修改内存中的登录、会话或消息状态，再把当前选中会话投影到 DOM。非当前会话的数据仍保存在 Map 中，切换列表后重新渲染；文本使用 textContent 创建，聊天内容不会被当成 HTML 执行。 渲染根据发送者 id 决定左右方向，并把正文作为文本节点写入；pending、sent、failed 状态映射为不同提示，特殊字符串不会执行为 HTML。 源码在这一段特别限定了“clearInterval(null) 是安全操作，因此本函数可在断线、退出和重新登录时重复调用。”，因此解释范围止于该局部步骤。
+主动退出同时清空消息、pending 和接收去重集合，防止下一位用户在同一标签页继承前一位
+用户的数据。短暂网络断线不会走此分支，所以重连后的重复消息仍可被识别。
 
 ### 片段 18：第 470-492 行
 

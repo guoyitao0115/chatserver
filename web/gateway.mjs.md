@@ -35,11 +35,14 @@ const STATIC_FILES = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
   ['/index.html', ['index.html', 'text/html; charset=utf-8']],
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
+  ['/message-dedup.js', ['message-dedup.js', 'text/javascript; charset=utf-8']],
   ['/styles.css', ['styles.css', 'text/css; charset=utf-8']],
 ]);
 ```
 
-这些依赖明确了本片段所在层的边界：长度帧、JSON、密码或随机数、TCP socket。项目内部头文件提供协议和领域对象，外部库只承担基础能力；业务数据如何流转仍由当前模块决定。
+静态资源使用显式白名单，避免把任意 URL 拼成磁盘路径。`app.js` 作为 ES module 会继续
+导入 `message-dedup.js`，所以该模块也必须列入白名单，否则首页虽能返回，浏览器应用
+仍会因模块 404 而启动失败。
 
 ### 片段 2：第 27-57 行
 

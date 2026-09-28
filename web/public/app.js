@@ -1,3 +1,5 @@
+import { MessageIdDeduplicator } from './message-dedup.js';
+
 // 轻量浏览器客户端：不引入框架，用一个集中 state 管理连接、会话、消息与重试状态。
 // 浏览器只通过同源 /ws 与网关通信；所有身份鉴权、权限判断、持久化和分布式去重仍由后端负责。
 
@@ -32,6 +34,8 @@ const state = {
   // messages: conversationKey -> 消息数组；pending: message_id -> 等待 ACK 的发送上下文。
   messages: new Map(),
   pending: new Map(),
+  // RabbitMQ 重投、确认超时后的离线兜底可能产生重复副本；最终展示层按全局 message_id 拦截。
+  receivedMessageIds: new MessageIdDeduplicator(10_000),
   // sequence 为每个会话单独维护递增 client_seq，用于同一发送方、同一会话的顺序判断。
   sequence: new Map(),
   heartbeatTimer: null,
@@ -199,9 +203,9 @@ function storeIncoming(message, notify = true) {
   const key = conversationKey(message);
   if (!state.messages.has(key)) state.messages.set(key, []);
   const bucket = state.messages.get(key);
-  // message_id 是端到端幂等键。即使服务端或网络重放同一消息，页面也只展示一份。
-  // 老版本不带 message_id 的消息无法可靠去重，因此仍按普通消息保存。
-  if (message.message_id && bucket.some((item) => item.message_id === message.message_id)) return;
+  // 使用独立有界集合而非扫描当前会话数组：同一 ID 即使从在线和离线两条路径到达，
+  // 或携带异常会话字段，也只能进入展示状态一次。旧消息没有 ID 时继续兼容显示。
+  if (state.receivedMessageIds.isDuplicate(message.message_id)) return;
   bucket.push({ ...message, delivery: '已送达' });
   if (activeKey() === key) renderMessages();
   else if (notify) showToast(`收到 ${message.name ?? message.id} 的新消息`);
@@ -463,6 +467,7 @@ $('#logout-button').addEventListener('click', () => {
   state.active = null;
   state.messages.clear();
   state.pending.clear();
+  state.receivedMessageIds.clear();
   chatView.classList.add('hidden');
   authView.classList.remove('hidden');
   authMessage.textContent = '已安全退出';

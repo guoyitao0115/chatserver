@@ -1,0 +1,4 @@
+interface:
+  display_name: "项目学习记录"
+  short_description: "自动沉淀本项目源码、架构、调试、构建、优化与面试知识"
+  default_prompt: "使用 $update-project-learning-record 回答项目问题并沉淀可复习结论。"

@@ -29,6 +29,7 @@ using json = nlohmann::json;
 #include "user.hpp"
 #include "public.hpp"
 #include "frameprotocol.hpp"
+#include "msgdedup.hpp"
 
 // ============================================================
 // 帧协议辅助函数（客户端版）
@@ -374,6 +375,9 @@ static unordered_map<string, map<uint64_t, BufferedMessage>> g_orderBuffer;
 static mutex g_orderMutex;
 static constexpr int ORDER_GAP_TIMEOUT_MS = 2000;
 static constexpr size_t ORDER_BUFFER_MAX_PER_SESSION = 100;
+// RabbitMQ manual ACK 重投、publisher confirm 超时后的离线兜底以及离线消息重放，
+// 都可能让同一逻辑消息沿不同路径到达客户端。最终展示前再按 message_id 去重。
+static MsgDedup g_receivedMsgDedup(50000, 24 * 60 * 60);
 
 static string buildSessionKey(const json &js)
 {
@@ -402,6 +406,17 @@ static string formatIncomingLine(const json &js)
 
 static void printOrderedIncoming(const json &js)
 {
+    if (js.contains("message_id") && js["message_id"].is_string())
+    {
+        const string messageId = js["message_id"].get<string>();
+        if (g_receivedMsgDedup.isDuplicate(messageId))
+        {
+            cerr << "[dedup] skip duplicate received message_id="
+                 << messageId << endl;
+            return;
+        }
+    }
+
     if (!js.contains("client_seq"))
     {
         cout << formatIncomingLine(js) << endl;

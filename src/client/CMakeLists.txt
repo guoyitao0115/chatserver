@@ -4,6 +4,7 @@ add_executable(ChatClient main.cpp)
 # 公共协议在 include/；model 目录中的数据对象用于解析登录响应。
 target_include_directories(ChatClient PRIVATE
     "${PROJECT_SOURCE_DIR}/include"
+    "${PROJECT_SOURCE_DIR}/include/server"
     "${PROJECT_SOURCE_DIR}/include/server/model"
 )
 # nlohmann/json 是随仓库提供的第三方头，标记 SYSTEM 可抑制依赖内部警告。

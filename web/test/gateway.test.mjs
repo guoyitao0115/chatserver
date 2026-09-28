@@ -182,6 +182,11 @@ test('HTTP health and WebSocket/TCP full bridge flow', async (t) => {
   assert.equal(health.status, 200);
   assert.equal((await health.json()).status, 'ok');
 
+  // app.js 会以 ES module 导入接收端去重器；白名单缺少该文件时真实页面会启动失败。
+  const dedupModule = await fetch(`http://127.0.0.1:${address.port}/message-dedup.js`);
+  assert.equal(dedupModule.status, 200);
+  assert.match(await dedupModule.text(), /class MessageIdDeduplicator/);
+
   // 浏览器 -> WebSocket -> TCP 后端 -> TCP 长度帧 -> WebSocket 的双向登录路径。
   client.send({ msgid: 1, id: 42, password: 'secret12' });
   const loginAck = await client.nextMessage();

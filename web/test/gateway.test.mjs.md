@@ -247,6 +247,11 @@ test('HTTP health and WebSocket/TCP full bridge flow', async (t) => {
   assert.equal(health.status, 200);
   assert.equal((await health.json()).status, 'ok');
 
+  // app.js 会以 ES module 导入接收端去重器；白名单缺少该文件时真实页面会启动失败。
+  const dedupModule = await fetch(`http://127.0.0.1:${address.port}/message-dedup.js`);
+  assert.equal(dedupModule.status, 200);
+  assert.match(await dedupModule.text(), /class MessageIdDeduplicator/);
+
   // 浏览器 -> WebSocket -> TCP 后端 -> TCP 长度帧 -> WebSocket 的双向登录路径。
   client.send({ msgid: 1, id: 42, password: 'secret12' });
   const loginAck = await client.nextMessage();
@@ -267,7 +272,9 @@ test('HTTP health and WebSocket/TCP full bridge flow', async (t) => {
   assert.equal(received[1].msg, '全链路消息');
 ```
 
-`t.after` 按依赖反向关闭测试客户端、网关和模拟后端；即使中途断言失败，随机监听端口也会释放，不影响下一次 Node 测试。
+健康检查之后实际请求 `message-dedup.js`。这条断言不是测试去重算法，而是确认
+`app.js` 的 ES module 依赖已经加入静态白名单；否则首页返回 200 也无法证明页面可以
+启动。`t.after` 仍保证任一断言失败后释放客户端、网关和模拟后端。
 
 ### 片段 8：第 203-213 行
 

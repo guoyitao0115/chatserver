@@ -49,6 +49,7 @@ using json = nlohmann::json;
 #include "user.hpp"
 #include "public.hpp"
 #include "frameprotocol.hpp"
+#include "msgdedup.hpp"
 
 // ============================================================
 // 帧协议辅助函数（客户端版）
@@ -68,7 +69,9 @@ static int sendFrame(int fd, const string &payload)
     }
 ```
 
-发送端先生成 4 字节长度头，再在写锁下循环 `send` 直到整个帧写完。锁保证心跳、重试和前台命令不会把各自字节交叉到同一 TCP 流。
+`msgdedup.hpp` 原本用于服务端 Redis 故障回退，现在也复用于 CLI 最终展示去重。发送
+端仍先生成 4 字节长度头，再在写锁下循环 `send`，保证心跳、重试和前台命令不会把
+各自字节交叉到同一 TCP 流。
 
 ### 片段 3：第 49-76 行
 
@@ -482,9 +485,13 @@ static unordered_map<string, map<uint64_t, BufferedMessage>> g_orderBuffer;
 static mutex g_orderMutex;
 static constexpr int ORDER_GAP_TIMEOUT_MS = 2000;
 static constexpr size_t ORDER_BUFFER_MAX_PER_SESSION = 100;
+// RabbitMQ manual ACK 重投、publisher confirm 超时后的离线兜底以及离线消息重放，
+// 都可能让同一逻辑消息沿不同路径到达客户端。最终展示前再按 message_id 去重。
+static MsgDedup g_receivedMsgDedup(50000, 24 * 60 * 60);
 ```
 
-主线程发送登录/注册后记录响应版本，并在条件变量上等待版本变化。接收线程处理响应后递增版本再唤醒；使用版本谓词可抵抗虚假唤醒，也不会把上一次响应误当成当前请求完成。
+顺序缓冲解决 `client_seq` 缺口，`g_receivedMsgDedup` 解决同一逻辑消息的多副本，两者
+职责不同。接收去重保存最多 50,000 个 ID、有效期 24 小时，避免集合无限增长。
 
 ### 片段 15：第 377-401 行
 
@@ -524,6 +531,17 @@ static string formatIncomingLine(const json &js)
 
 static void printOrderedIncoming(const json &js)
 {
+    if (js.contains("message_id") && js["message_id"].is_string())
+    {
+        const string messageId = js["message_id"].get<string>();
+        if (g_receivedMsgDedup.isDuplicate(messageId))
+        {
+            cerr << "[dedup] skip duplicate received message_id="
+                 << messageId << endl;
+            return;
+        }
+    }
+
     if (!js.contains("client_seq"))
     {
         cout << formatIncomingLine(js) << endl;
@@ -555,7 +573,9 @@ static void printOrderedIncoming(const json &js)
         }
 ```
 
-消息按“会话 + 发送者”维护下一期望序号和缓冲 map。等于期望值时输出并连续冲刷后继；大于期望值先缓存；序号洞超过等待时间后由后台任务跳过，避免永远卡住后续消息。
+消息进入顺序缓冲前先按 `message_id` 去重，因此 online、RabbitMQ 重投和 offline replay
+即使携带相同 `client_seq` 或没有序号，也只会展示一次。之后才按“会话 + 发送者”
+维护下一期望序号，避免把消息 ID 幂等和展示顺序混成同一种机制。
 
 ### 片段 17：第 434-465 行
 
@@ -931,7 +951,7 @@ void readTaskHandler(int clientfd)
         }
 ```
 
-只有已认证连接才能续租自己的在线路由。Redis 条件续期失败可能表示路由已被新会话接管，此时当前连接不应覆盖它；心跳响应回显客户端时间戳，客户端同时获得存活确认和简单 RTT 依据。
+`HEARTBEAT_MSG_ACK`（13）不是聊天消息的 `MSG_ACK`（11）：它仅表示服务端已收到并通过身份校验这一轮心跳。CLI 收到它后把 `g_heartbeatAcked` 设为 true，供下一轮心跳前检查“上一轮是否有回应”；它不移除聊天消息的 pending 项，也不表示接收方已收到聊天内容。服务端当前在 Redis 条件续期不匹配时仍回 13，因此它也不能证明该连接仍持有 Redis 路由；返回中的 `echo_ts` 只可供客户端计算这一轮请求/应答耗时。Web 端当前收到 13 后不维护额外状态，直接忽略。
 
 ### 片段 28：第 733-754 行
 

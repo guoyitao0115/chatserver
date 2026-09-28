@@ -101,13 +101,16 @@ ChatService::ChatService()
     if (!_rabbitMqBus.connect(rabbitHost, rabbitPort, rabbitExchange, _serverId,
                               rabbitUser, rabbitPassword))
     {
-        LOG_WARN << "RabbitMQ unavailable; cross-node delivery will fall back to offline storage";
+        LOG_WARN << "RabbitMQ initially unavailable; reconnect is running and current "
+                    "cross-node delivery will fall back to offline storage";
     }
 ```
 
 构造阶段把协议号 `CREATE_GROUP_MSG`、`ADD_GROUP_MSG`、`GROUP_CHAT_MSG`、`HEARTBEAT_MSG` 绑定到成员处理器。网络层以后只需用 JSON 中的 msgid 查表，不需要不断扩展 switch；所有回调都绑定同一个 ChatService 实例，因而共享认证连接表。
 
-基础设施初始化的先后顺序有实际意义：Redis 先用于登录路由和去重；RabbitMQ 先安装消费回调，再建立队列并启动消费线程，避免连接刚成功就收到消息却没有处理函数。MQ 连接失败只记录降级，后续跨节点消息仍可落入离线表。
+基础设施初始化的先后顺序有实际意义：Redis 先用于登录路由和去重；RabbitMQ 先安装
+返回 bool 的消费回调，再建立队列并启动消费线程，避免连接刚成功就收到消息却没有
+处理函数。首次连接失败只记录降级，消费线程仍会重连，当前跨节点消息则落入离线表。
 
 本片段读取 `CHAT_RABBITMQ_HOST`、`CHAT_RABBITMQ_PORT`、`CHAT_RABBITMQ_EXCHANGE`、`CHAT_RABBITMQ_USER`、`CHAT_RABBITMQ_PASSWORD`。未设置时采用紧邻的本机默认值；容器部署则覆盖这些值，因此同一二进制可以作为不同节点运行，无需重新编译。
 
@@ -1075,7 +1078,7 @@ void ChatService::heartbeat(const TcpConnectionPtr &conn, json &js, Timestamp)
 // handleRabbitMqBusMessage：direct 路由模式下，该消息就是发给本实例的目标用户
 //   直接按 userid 在本节点连接表投递；若用户刚好下线，则降级离线库
 // ============================================================
-void ChatService::handleRabbitMqBusMessage(int userid, string msg)
+bool ChatService::handleRabbitMqBusMessage(int userid, string msg)
 {
     TcpConnectionPtr localConn;
     {
@@ -1090,11 +1093,13 @@ void ChatService::handleRabbitMqBusMessage(int userid, string msg)
     {
         localConn->send(FrameCodec::encode(msg));
         LOG_INFO << "[rabbitmqMsg] userid=" << userid << " route=local";
-        return;
+        return true;
     }
 ```
 
-RabbitMQ 把“目标用户 id + 原消息”送到目标节点。消费回调重新检查本地连接：仍在线就直接发帧；若路由与连接之间发生断线竞态，则写离线表，避免消息到达节点后无处投递。
+RabbitMQ 把“目标用户 id + 原消息”送到目标节点。消费回调重新检查本地连接：仍在线
+就发帧并返回 true，使消费线程手动 ACK；若路由与连接之间发生断线竞态，则继续尝试
+离线落库，而不是提前确认消息。
 
 ### 片段 33：第 833-845 行
 
@@ -1106,15 +1111,18 @@ RabbitMQ 把“目标用户 id + 原消息”送到目标节点。消费回调�
     {
         LOG_ERROR << "[rabbitmqMsg] userid=" << userid
                   << " route=offline_fallback insert_failed";
-        return;
+        return false;
     }
 
     LOG_INFO << "[rabbitmqMsg] userid=" << userid << " route=offline_fallback";
+    return true;
 }
 
 ```
 
-这部分处在离线恢复链路：在线路由不可用时保存完整消息，用户登录时按落库顺序装入响应。当前“读取后删除”是一次性交付语义；若发送登录响应前后进程崩溃，客户端仍应依靠 message_id 去重。
+这部分处在离线恢复链路：落库成功返回 true，RabbitMQ 删除队列消息；数据库失败返回
+false，消费线程 NACK/requeue，避免自动 ACK 后永久丢失。manual ACK 本身丢失仍可能
+造成重投，因此客户端还要依靠 `message_id` 去重。
 
 ## 面试重点
 

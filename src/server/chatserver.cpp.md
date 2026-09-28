@@ -298,7 +298,7 @@ void ChatServer::checkIdleConnections()
     const auto now = chrono::steady_clock::now();
 ```
 
-巡检先在锁内收集超过空闲阈值的连接，解锁后再 shutdown。分两阶段避免关闭连接触发回调时重入同一把锁。
+巡检先在锁内收集超过空闲阈值的连接，解锁后再 shutdown。`toClose` 是本轮“待关闭连接”的局部 `vector<TcpConnectionPtr>`，不是关闭动作本身：`push_back` 复制强引用，确保从活动表删掉 weak_ptr 后对象仍存活到后面的循环。分两阶段让锁内只做判断、升级 weak_ptr 和 `erase`（避免下轮重复选中）；`shutdown()` 可能投递到连接所属子 Reactor 并最终触发关闭生命周期，放在锁外可避免长时间占用或重入活动表锁。
 
 ### 片段 10：第 224-245 行
 

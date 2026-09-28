@@ -59,7 +59,11 @@ old/            历史版本，仅用于对照
 ## 关键说明
 
 - 浏览器不能直接连接原始 TCP 服务，`web/gateway.mjs` 只做 WebSocket 与四字节长度帧的协议转换，不承载聊天业务。
-- Redis 负责共享去重键和 `userId -> serverId` 在线路由；RabbitMQ direct exchange 负责跨节点定向投递。
+- Redis 负责共享去重键和 `userId -> serverId` 在线路由；RabbitMQ direct exchange
+  使用 durable 节点队列、持久消息、publisher confirm、mandatory 路由检查和手动消费
+  ACK 完成跨节点定向投递，连接异常时自动重连。
+- RabbitMQ 发布或确认失败时同步写 MySQL 离线表；CLI 与 Web 接收端再按
+  `message_id` 去重，处理确认丢失、重新入队和在线/离线双路径副本。
 - MySQL 保存账户、关系、群组和离线消息。
 - Docker Compose 凭据只用于本地演示，真实部署请通过环境变量或密钥管理系统替换。
 

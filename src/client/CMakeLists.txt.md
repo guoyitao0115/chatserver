@@ -17,6 +17,7 @@ add_executable(ChatClient main.cpp)
 # 公共协议在 include/；model 目录中的数据对象用于解析登录响应。
 target_include_directories(ChatClient PRIVATE
     "${PROJECT_SOURCE_DIR}/include"
+    "${PROJECT_SOURCE_DIR}/include/server"
     "${PROJECT_SOURCE_DIR}/include/server/model"
 )
 # nlohmann/json 是随仓库提供的第三方头，标记 SYSTEM 可抑制依赖内部警告。
@@ -31,7 +32,9 @@ target_compile_options(ChatClient PRIVATE
 )
 ```
 
-这一构建片段把依赖发现、源文件范围和目标属性固定下来。配置阶段缺少依赖会在这里提前失败，而不是等链接或运行时才暴露；目标级 include/link 设置也避免污染无关程序。
+`include/server` 新增到客户端私有搜索路径，是为了复用线程安全的 `MsgDedup`，让 CLI
+接收端也能按 `message_id` 做有界 LRU+TTL 去重。它只影响 ChatClient，不会把服务端
+头路径传播给其他目标。
 
 ## 面试重点
 

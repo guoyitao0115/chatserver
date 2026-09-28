@@ -70,7 +70,8 @@ ChatService::ChatService()
     if (!_rabbitMqBus.connect(rabbitHost, rabbitPort, rabbitExchange, _serverId,
                               rabbitUser, rabbitPassword))
     {
-        LOG_WARN << "RabbitMQ unavailable; cross-node delivery will fall back to offline storage";
+        LOG_WARN << "RabbitMQ initially unavailable; reconnect is running and current "
+                    "cross-node delivery will fall back to offline storage";
     }
 }
 
@@ -813,7 +814,7 @@ void ChatService::heartbeat(const TcpConnectionPtr &conn, json &js, Timestamp)
 // handleRabbitMqBusMessage：direct 路由模式下，该消息就是发给本实例的目标用户
 //   直接按 userid 在本节点连接表投递；若用户刚好下线，则降级离线库
 // ============================================================
-void ChatService::handleRabbitMqBusMessage(int userid, string msg)
+bool ChatService::handleRabbitMqBusMessage(int userid, string msg)
 {
     TcpConnectionPtr localConn;
     {
@@ -828,7 +829,7 @@ void ChatService::handleRabbitMqBusMessage(int userid, string msg)
     {
         localConn->send(FrameCodec::encode(msg));
         LOG_INFO << "[rabbitmqMsg] userid=" << userid << " route=local";
-        return;
+        return true;
     }
 
     // 目标用户在消息到达时刚好不在本节点连接表，降级写离线库兜底
@@ -837,9 +838,10 @@ void ChatService::handleRabbitMqBusMessage(int userid, string msg)
     {
         LOG_ERROR << "[rabbitmqMsg] userid=" << userid
                   << " route=offline_fallback insert_failed";
-        return;
+        return false;
     }
 
     LOG_INFO << "[rabbitmqMsg] userid=" << userid << " route=offline_fallback";
+    return true;
 }
  

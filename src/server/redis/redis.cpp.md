@@ -197,7 +197,7 @@ int Redis::refreshUserServerIfMatches(int userid, const string &serverId, int tt
     }
 ```
 
-Lua 脚本先比较当前值是否仍是本节点，再执行 EXPIRE。把比较和续期放在 Redis 内原子完成，旧连接的心跳不能延长新节点路由之外的错误状态。
+Lua 脚本先比较当前值是否仍是本节点，再执行 EXPIRE。典型时序是：旧会话的值为 `server-A`，其路由过期后用户在 `server-B` 重新登录并写入 `server-B`；A 的迟到心跳会比较失败，不能把 B 的 TTL 重置为 120 秒。若应用先单独 `GET` 再单独 `EXPIRE`，A 可能在两条命令之间读到 A、随后 B 接管、最后却把 B 的 key 续期；Lua 在 Redis 内连续执行两步，不会留下这个窗口。注意值中只有 `serverId`，因此它防的是跨实例的旧会话干扰；新旧连接若在同一实例，二者值相同，仍无法区分，需额外存会话唯一 token 才能完全隔离。
 
 只有已认证连接才能续租自己的在线路由。Redis 条件续期失败可能表示路由已被新会话接管，此时当前连接不应覆盖它；心跳响应回显客户端时间戳，客户端同时获得存活确认和简单 RTT 依据。
 

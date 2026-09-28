@@ -99,11 +99,13 @@ public:
     void reset();
     // 按 msgid 返回处理器副本；未知类型返回记录错误的安全占位处理器，而非空函数。
     MsgHandler getHandler(int msgid);
-    // RabbitMQ 消费线程入口：优先发给本节点连接，竞态下已下线则写入离线库兜底。
-    void handleRabbitMqBusMessage(int userid, string msg);
+    // RabbitMQ 消费线程入口：成功发给本地连接或写入离线库后返回 true，消息总线才 ACK。
+    bool handleRabbitMqBusMessage(int userid, string msg);
 ```
 
-登录后才周期发送心跳。发送下一轮前若上一轮仍未确认，只提示连接可能不稳定而不立即断开，减少短暂调度延迟造成误判；收到 HEARTBEAT_ACK 后接收线程会重新设置确认标志。
+这里的布尔返回值是业务层和 RabbitMQ manual ACK 之间的契约：本地投递或离线落库成功
+才返回 true，消费线程随后 ACK；落库失败返回 false，消费线程 NACK/requeue。它避免
+MQ 在业务真正完成前删除消息。
 
 ### 片段 4：第 77-104 行
 

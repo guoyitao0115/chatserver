@@ -72,8 +72,8 @@ public:
     void reset();
     // 按 msgid 返回处理器副本；未知类型返回记录错误的安全占位处理器，而非空函数。
     MsgHandler getHandler(int msgid);
-    // RabbitMQ 消费线程入口：优先发给本节点连接，竞态下已下线则写入离线库兜底。
-    void handleRabbitMqBusMessage(int userid, string msg);
+    // RabbitMQ 消费线程入口：成功发给本地连接或写入离线库后返回 true，消息总线才 ACK。
+    bool handleRabbitMqBusMessage(int userid, string msg);
 
 private:
     // 私有构造器完成处理器注册和 Redis/RabbitMQ 初始化，防止产生多个状态中心。
